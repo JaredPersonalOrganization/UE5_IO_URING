@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "LinuxPlatformIoDispatcher",
+	"Description": "Linux Platform IO Dispatcher",
+	"Category": "Other",
+	"CreatedBy": "Jared Hane",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "LinuxPlatformIoDispatcher",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

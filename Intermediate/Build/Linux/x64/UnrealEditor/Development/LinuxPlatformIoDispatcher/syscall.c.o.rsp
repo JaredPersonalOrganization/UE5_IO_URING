@@ -1,0 +1,99 @@
+-DUSE_DEBUG_LOGGING=0
+-DUSE_EVENT_LOGGING=0
+--driver-mode=g++
+-gz=zlib
+-nostdinc++
+-isystem"../Extras/ThirdPartyNotUE/SDKs/HostLinux/Linux_x64/v26_clang-20.1.8-rockylinux8/x86_64-unknown-linux-gnu/include"
+-isystem"../Extras/ThirdPartyNotUE/SDKs/HostLinux/Linux_x64/v26_clang-20.1.8-rockylinux8/x86_64-unknown-linux-gnu/include/c++/v1"
+-fbinutils-version=2.36
+-fno-math-errno
+-fno-rtti
+-mssse3
+-fPIC
+-ftls-model=local-dynamic
+-target x86_64-unknown-linux-gnu
+--sysroot="../Extras/ThirdPartyNotUE/SDKs/HostLinux/Linux_x64/v26_clang-20.1.8-rockylinux8/x86_64-unknown-linux-gnu"
+-c
+-pipe
+-msse4.2
+-I"."
+-I"/home/jared-hane/Documents/Unreal Projects/PCDesigner/Plugins/LinuxPlatformIoDispatcher/Source/LinuxPlatformIoDispatcher/Private"
+-I"Runtime/Core/Public"
+-I"Runtime/TraceLog/Public"
+-I"Runtime/AutoRTFM/Public"
+-I"../Intermediate/Build/Linux/UnrealEditor/Inc/ImageCore/UHT"
+-I"Runtime/ImageCore/Public"
+-I"../Intermediate/Build/Linux/UnrealEditor/Inc/CoreUObject/UHT"
+-I"../Intermediate/Build/Linux/UnrealEditor/Inc/CoreUObject/VerseVMBytecode"
+-I"Runtime/CoreUObject/Public"
+-I"Runtime/CorePreciseFP/Public"
+-I"Runtime/Core/Internal"
+-I"/home/jared-hane/Documents/Unreal Projects/PCDesigner/Plugins/LinuxPlatformIoDispatcher/Source"
+-I"/home/jared-hane/Documents/Unreal Projects/PCDesigner/Plugins/LinuxPlatformIoDispatcher/Source/LinuxPlatformIoDispatcher/Public"
+-I"Runtime/PakFile/Public"
+-I"Runtime/RSA/Public"
+-isystem"ThirdParty/GuidelinesSupportLibrary/GSL-1144/include"
+-isystem"ThirdParty/AtomicQueue"
+-Wall
+-Werror
+-ftabstop=4
+-Wenum-conversion
+-Wshadow
+-Wno-dllexport-explicit-instantiation-decl
+-Wno-undefined-var-template
+-Wno-unused-but-set-variable
+-Wno-unused-but-set-parameter
+-Wno-unused-function
+-Wno-unused-lambda-capture
+-Wno-unused-local-typedef
+-Wno-unused-private-field
+-Wno-unused-variable
+-Wno-unknown-pragmas
+-Wno-tautological-compare
+-Wno-switch
+-Wno-invalid-offsetof
+-Wno-inconsistent-missing-override
+-Wno-gnu-string-literal-operator-template
+-Wno-missing-template-arg-list-after-template-kw
+-Wno-cast-function-type-mismatch
+-Wno-extra-qualification
+-Wno-nan-infinity-disabled
+-Wno-nontrivial-memaccess
+-Wno-invalid-unevaluated-string
+-Wno-deprecated-copy
+-Wno-bitwise-instead-of-logical
+-Wno-ordered-compare-function-pointers
+-Wno-deprecated-volatile
+-Wno-deprecated-anon-enum-enum-conversion
+-Wno-ambiguous-reversed-operator
+-Wno-enum-float-conversion
+-Wno-enum-enum-conversion
+-Wbitfield-enum-conversion
+-Wdelete-non-virtual-dtor
+-Wundef
+-Wno-float-conversion
+-Wno-implicit-float-conversion
+-Wno-implicit-int-conversion
+-Wno-c++11-narrowing
+-Wdeprecated-declarations
+-Wno-error=deprecated-declarations
+-Wno-shorten-64-to-32
+-Wno-deprecated-copy-with-user-provided-copy
+-fdiagnostics-absolute-paths
+-fdiagnostics-color
+-Wno-dangling
+-Wno-undefined-bool-conversion
+-ffp-contract=off
+-fno-delete-null-pointer-checks
+-O3
+-fexceptions
+-DPLATFORM_EXCEPTIONS_DISABLED=0
+-gdwarf-4
+-ggnu-pubnames
+-fvisibility-ms-compat
+-fvisibility-inlines-hidden
+-include "/home/jared-hane/Documents/Unreal Projects/PCDesigner/Plugins/LinuxPlatformIoDispatcher/Intermediate/Build/Linux/x64/UnrealEditor/Development/LinuxPlatformIoDispatcher/Definitions.c.h"
+-x c
+"/home/jared-hane/Documents/Unreal Projects/PCDesigner/Plugins/LinuxPlatformIoDispatcher/Source/LinuxPlatformIoDispatcher/Private/uring/syscall.c"
+-MD -MF"/home/jared-hane/Documents/Unreal Projects/PCDesigner/Plugins/LinuxPlatformIoDispatcher/Intermediate/Build/Linux/x64/UnrealEditor/Development/LinuxPlatformIoDispatcher/syscall.c.d"
+-o "/home/jared-hane/Documents/Unreal Projects/PCDesigner/Plugins/LinuxPlatformIoDispatcher/Intermediate/Build/Linux/x64/UnrealEditor/Development/LinuxPlatformIoDispatcher/syscall.c.o"

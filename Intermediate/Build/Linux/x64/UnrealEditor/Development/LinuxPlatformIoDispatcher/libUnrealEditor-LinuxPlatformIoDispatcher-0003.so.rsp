@@ -1,0 +1,6 @@
+"/home/jared-hane/Documents/Unreal Projects/PCDesigner/Plugins/LinuxPlatformIoDispatcher/Intermediate/Build/Linux/x64/UnrealEditor/Development/LinuxPlatformIoDispatcher/Module.LinuxPlatformIoDispatcher.cpp.o"
+-soname="libUnrealEditor-LinuxPlatformIoDispatcher-0003.so"
+-rpath-link="/home/jared-hane/Documents/Unreal Projects/PCDesigner/Plugins/LinuxPlatformIoDispatcher/Binaries/Linux"
+-L"../Binaries/Linux"
+--start-group
+--end-group
