@@ -2,7 +2,7 @@
 
 # About
 
-Implementation of io_uring for Unreal Engine. Designed to be used with cooked content PakFiles. Requires no modifications to the source code of Unreal Engine, and is considerably faster than the default.
+Implementation of io_uring for Unreal Engine. Designed to be used with cooked content. Requires no modifications to the source code of Unreal Engine, and is considerably faster than the default.
 
 
 # Benchmarks
@@ -36,7 +36,8 @@ Implementation of io_uring for Unreal Engine. Designed to be used with cooked co
 # Installation
 
 - Clone the repository into the plugins folder of your project
-- That's it! The Engine will automatically load it.
+- Enable the plugin
+- That's it!
 
 
 # Features
