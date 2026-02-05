@@ -78,7 +78,7 @@ int32 GIoWqMaxBoundedWorkers = 0;
 static FAutoConsoleVariableRef CVarIoWqMaxBoundedWorkers(
 	TEXT("r.Linux.Streaming.IoWqMaxBoundedWorkers"),
 	GIoWqMaxBoundedWorkers,
-	TEXT("Maximum number of bounded workers created io_uring. Loosely enforced. Supported since version 5.15")
+	TEXT("Maximum number of bounded workers created io_uring. Softly enforced. Supported since version 5.15")
 		 TEXT("By default io_uring limits the number of bounded workers by the SQ Ring size and the number of CPUs on the system."),
 		 ECVF_ReadOnly
 );
@@ -87,7 +87,7 @@ int32 GIoWqMaxUnboundedWorkers = 0;
 static FAutoConsoleVariableRef CVarIoWqMaxUnboundedWorkers(
 	TEXT("r.Linux.Streaming.IoWqMaxUnboundedWorkers"),
 	GIoWqMaxUnboundedWorkers,
-	TEXT("Maximum number of Unbounded workers created io_uring. Loosely enforced. Supported since version 5.15")
+	TEXT("Maximum number of Unbounded workers created io_uring. Softly enforced. Supported since version 5.15")
 		 TEXT("By defualt io_uring limits the number of unbounded workers by the RLIMIT_NPROC limit of the system."),
 		 ECVF_ReadOnly
 );
@@ -525,7 +525,7 @@ bool FLinuxPlatformIoDispatcher::InitializeUring()
 			{
 				Workers[0] = GIoWqMaxBoundedWorkers > 0 ? GIoWqMaxBoundedWorkers : 0;
 				Workers[1] = GIoWqMaxUnboundedWorkers > 0 ? GIoWqMaxUnboundedWorkers : 0;
-				VERIFY_URING_SAFE(io_uring_register_iowq_max_workers(&Ring, Workers), bCallResult); // Loosely enforced
+				VERIFY_URING_SAFE(io_uring_register_iowq_max_workers(&Ring, Workers), bCallResult); // Softly enforced
 			}
 		}
 	}

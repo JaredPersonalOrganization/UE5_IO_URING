@@ -19,7 +19,7 @@ Implementation of io_uring for Unreal Engine. Designed to be used with cooked co
 | LinuxIOUring / High  | 32         | 51.007              | 9.834               |
 | Default              | —          | 83.318              | N/A                 |
 
-### Loading 180000 Texture 87GB~ with FBulkDataBatchRequest::FBatchBuilder
+### Loading 180000 Textures 87GB~ with FBulkDataBatchRequest::FBatchBuilder
  
 | Backend / Priority    | Batch Size | Avg TimeElapsed (s) | Avg Actual Time (s) |
 | --------------------- | ---------- | ------------------- | ------------------- |
@@ -51,7 +51,7 @@ Implementation of io_uring for Unreal Engine. Designed to be used with cooked co
 
 ```r.Linux.Streaming.RegisterBuffers``` - Whether to register buffers. May have a performance improvement. Default Enabled.
 
-```r.Linux.Streaming.UseSQPollThread``` - Whether to use a SQPoll thread. This isn't a free performance switch. Currently it makes the performance worse. Default Disabled
+```r.Linux.Streaming.UseSQPollThread``` - Whether to use a SQPoll thread. This isn't a free performance button. It currently makes the performance worse. Default Disabled.
 
 ```r.Linux.Streaming.SqPollIdleTimeMS``` - SQPoll sleep timer. Default 50.
 
@@ -65,6 +65,6 @@ Implementation of io_uring for Unreal Engine. Designed to be used with cooked co
 
 ```r.Linux.Streaming.BatchSize``` - Batch size before we submit. Should be small to prevent starving decompression workers. Don't set lower than 2, otherwise this is a glorified read(). Default 4.
 
-```r.Linux.Streaming.IoWqMaxBoundedWorkers``` - Maximum number of bounded workers created io_uring. Loosely enforced. Supported since version 5.15. Default 0(Disabled).
+```r.Linux.Streaming.IoWqMaxBoundedWorkers``` - Maximum number of bounded workers created io_uring. Softly enforced. Supported since version 5.15. Default 0(Disabled).
 
-```r.Linux.Streaming.IoWqMaxUnboundedWorkers``` - Maximum number of Unbounded workers created io_uring. Loosely enforced. Supported since version 5.15. Default 0(Disabled)
+```r.Linux.Streaming.IoWqMaxUnboundedWorkers``` - Maximum number of Unbounded workers created io_uring. Softly enforced. Supported since version 5.15. Default 0(Disabled)
