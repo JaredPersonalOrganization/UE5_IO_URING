@@ -48,7 +48,7 @@ bool GUseIOPoll = false;
 static FAutoConsoleVariableRef CVarUseIOPoll(
 	TEXT("r.Linux.Streaming.UseIOPoll"),
 	GUseIOPoll,
-	TEXT("Tries to use IOPoll. Checks /sys/module/nvme/parameters/poll_queues to see if it's available."),
+	TEXT("Tries to use IOPoll. Checks /sys/module/nvme/parameters/poll_queues to see if it's available. Do not use this. Most of the time it will not work."),
 	ECVF_ReadOnly
 );
 
