@@ -7,6 +7,8 @@
 #include "IPlatformFilePak.h"
 #include "LinuxFileHandle.h"
 #include "LinuxPlatformIoDispatcherModule.h"
+#include "Misc/FileHelper.h"
+#include "uring/int_flags.h"
 #include "uring/liburing.h"
 
 
@@ -42,6 +44,14 @@ static FAutoConsoleVariableRef CVarUseDirectIO(
 	ECVF_ReadOnly
 );
 
+bool GUseIOPoll = false;
+static FAutoConsoleVariableRef CVarUseIOPoll(
+	TEXT("r.Linux.Streaming.UseIOPoll"),
+	GUseIOPoll,
+	TEXT("Tries to use IOPoll. Checks /sys/module/nvme/parameters/poll_queues to see if it's available."),
+	ECVF_ReadOnly
+);
+
 int32 GDirectIODefaultBufferAlignment = 4096;
 static FAutoConsoleVariableRef CVarDirectIODefaultBufferAlignment(
 	TEXT("r.Linux.Streaming.DirectIOBufferAlignment"),
@@ -58,11 +68,11 @@ static FAutoConsoleVariableRef CVarMaxOpenFiles(
 	ECVF_ReadOnly
 );
 
-int32 GMaxPendingRequests = -1;
-static FAutoConsoleVariableRef CVarMaxPendingRequests(
-	TEXT("r.Linux.Streaming.MaxPendingRequests"),
+int32 GQueueDepth = -1;
+static FAutoConsoleVariableRef CVarQueueDepth(
+	TEXT("r.Linux.Streaming.QueueDepth"),
 	GMaxNumOpenFiles,
-	TEXT("Sets the maximum number of in submission queue entries. Default matches the number of read buffers.\n"),
+	TEXT("Sets the queue depth of the submission queue entries. Default matches the number of read buffers.\n"),
 	ECVF_ReadOnly
 );
 
@@ -199,7 +209,7 @@ void FLinuxPlatformIoDispatcher::UnregisterFile(class FLinuxFileHandle* File)
 	
 bool FLinuxPlatformIoDispatcher::OpenContainer(const TCHAR* ContainerFilePath, uint64& ContainerFileHandle, uint64& ContainerFileSize)
 {
-	if (FLinuxFileHandle* Handle = FLinuxFileHandle::CreateFileHandle(ContainerFilePath, GUseDirectIO))
+	if (FLinuxFileHandle* Handle = FLinuxFileHandle::CreateFileHandle(ContainerFilePath, bUseDirectIO))
 	{
 		Handle->Close(); 
 		ContainerFileSize = Handle->GetSize();
@@ -247,36 +257,37 @@ bool FLinuxPlatformIoDispatcher::CreateCustomRequests(FFileIoStoreResolvedReques
 	return false;
 }
 
-void FLinuxPlatformIoDispatcher::UpdateRegisteredBuffers(uint8* Memory,const uint64 SizePerBuffer, const uint64 NumBuffers)
+void FLinuxPlatformIoDispatcher::UpdateRegisteredBuffers(uint8* Start)
 {
 	const bool bNeedsReset = !RegisteredBuffers.IsEmpty();
 	RegisteredBuffers.Reset();
 	constexpr uint64 MaxBufferSize =  1ull << 30; // Max 1GiB
-	const uint64 TotalSize = SizePerBuffer * NumBuffers;
+	const uint64 TotalSize = ActualBufferSize * NumAllocatedBuffers;
+	
 	if (TotalSize > MaxBufferSize) 
 	{
 		// Break it up into smaller chunks
-		const uint64 RegisteredBuffersPerAlloc = MaxBufferSize / SizePerBuffer;
-		const uint64 SizePerAlloc = RegisteredBuffersPerAlloc * SizePerBuffer;
+		const uint64 RegisteredBuffersPerAlloc = MaxBufferSize / ActualBufferSize;
+		const uint64 SizePerAlloc = RegisteredBuffersPerAlloc * ActualBufferSize;
 					
 		uint64 BufferIndex = 0;
-		while (BufferIndex + RegisteredBuffersPerAlloc <= NumBuffers) 
+		while (BufferIndex + RegisteredBuffersPerAlloc <= NumAllocatedBuffers) 
 		{
-			uint8* Current = Memory + BufferIndex * SizePerBuffer;
+			uint8* Current = Start + BufferIndex * ActualBufferSize;
 			RegisteredBuffers.Add(iovec{.iov_base = Current, .iov_len = SizePerAlloc});
 			BufferIndex += RegisteredBuffersPerAlloc;
 		}
 					
-		if (BufferIndex < NumBuffers) 
+		if (BufferIndex < NumAllocatedBuffers) 
 		{
 			uint32 Remaining = NumAllocatedBuffers - BufferIndex;
-			uint8* Current = Memory + BufferIndex * SizePerBuffer;
-			RegisteredBuffers.Add(iovec{.iov_base = Current, .iov_len = SizePerBuffer * Remaining});
+			uint8* Current = Start + BufferIndex * ActualBufferSize;
+			RegisteredBuffers.Add(iovec{.iov_base = Current, .iov_len = ActualBufferSize * Remaining});
 		}
 	}
 	else
 	{
-		RegisteredBuffers.Add(iovec{.iov_base = Memory, .iov_len = TotalSize});
+		RegisteredBuffers.Add(iovec{.iov_base = Start, .iov_len = TotalSize});
 	}
 	
 	if (bNeedsReset)
@@ -288,23 +299,30 @@ void FLinuxPlatformIoDispatcher::UpdateRegisteredBuffers(uint8* Memory,const uin
 	
 	VERIFY_URING(io_uring_register_buffers(&Ring, RegisteredBuffers.GetData(), RegisteredBuffers.Num()));
 	
-	UE_LOG(LogLinuxPlatformIO, Display, TEXT("Registered %d buffers with %llu size for io_uring"), RegisteredBuffers.Num(), SizePerBuffer);
+	UpdateRegisteredBuffersOffset();
+	
+	UE_LOG(LogLinuxPlatformIO, Display, TEXT("Registered %d buffers with %llu size for io_uring"), RegisteredBuffers.Num(), ActualBufferSize);
 }
 
-int32 FLinuxPlatformIoDispatcher::GetRegisteredBufferOffset(const uint8* Memory)
+void FLinuxPlatformIoDispatcher::UpdateRegisteredBuffersOffset()
 {
-	// Check where the pointer resides inside the registered buffers.
-	for (int32 RegisteredBufferIndex = 0; RegisteredBufferIndex < RegisteredBuffers.Num(); ++RegisteredBufferIndex)
+	for (auto& Pair : AcquiredBufferProperties)
 	{
-		uint8* Base = static_cast<uint8*>(RegisteredBuffers[RegisteredBufferIndex].iov_base);
-		const uint64 Length  = RegisteredBuffers[RegisteredBufferIndex].iov_len;
-
-		if (Memory >= Base && Memory < Base + Length)
+		const uint8* Memory = Pair.Value.NewBuffer ? Pair.Value.NewBuffer : Pair.Key->Memory;
+		Pair.Value.BufferIndex = -1;
+		for (int32 RegisteredBufferIndex = 0; RegisteredBufferIndex < RegisteredBuffers.Num(); ++RegisteredBufferIndex)
 		{
-			return RegisteredBufferIndex;
+			uint8* Base = static_cast<uint8*>(RegisteredBuffers[RegisteredBufferIndex].iov_base);
+			const uint64 Length  = RegisteredBuffers[RegisteredBufferIndex].iov_len;
+
+			if (Memory >= Base && Memory < Base + Length)
+			{
+				Pair.Value.BufferIndex = RegisteredBufferIndex;
+				break;
+			}
 		}
+		check(Pair.Value.BufferIndex != -1);
 	}
-	return INDEX_NONE;
 }
 
 TUniquePtr<FLinuxPlatformIoDispatcher> FLinuxPlatformIoDispatcher::Create()
@@ -322,8 +340,8 @@ int32 FLinuxPlatformIoDispatcher::CreateRing()
 {
 	const bool bIsMultiThreaded = FGenericPlatformProcess::SupportsMultithreading();
 	
-	int32 MaxPendingRequests = GMaxPendingRequests;
-	if (GMaxPendingRequests == -1)
+	int32 MaxPendingRequests = GQueueDepth;
+	if (MaxPendingRequests == -1)
 	{
 		auto DispatcherBufferMemory = IConsoleManager::Get().FindConsoleVariable(TEXT("s.IoDispatcherBufferMemoryMB"));
 		check(DispatcherBufferMemory);
@@ -350,10 +368,15 @@ int32 FLinuxPlatformIoDispatcher::CreateRing()
 		Params.sq_thread_idle = GSQPollIdleTimeMS;
 		return io_uring_queue_init_params(MaxPendingRequests, &Ring, &Params);
 #endif
-		
 		Params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SUBMIT_ALL;
 		Params.sq_thread_idle = GSQPollIdleTimeMS;
 		bMustEnableRing = false;
+		
+		if (bUseIOPoll)
+		{
+			Params.flags |= IORING_SETUP_IOPOLL;
+		}
+		
 		if (io_uring_queue_init_params(MaxPendingRequests, &Ring, &Params) == 0)
 		{
 			return 0;
@@ -373,6 +396,11 @@ int32 FLinuxPlatformIoDispatcher::CreateRing()
 #endif
 		
 		Params.flags = IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_R_DISABLED;
+		
+		if (bUseIOPoll)
+		{
+			Params.flags |= IORING_SETUP_IOPOLL;
+		}
 		
 		if (io_uring_queue_init_params(MaxPendingRequests, &Ring, &Params) == 0)
 		{
@@ -411,61 +439,99 @@ void FLinuxPlatformIoDispatcher::FinalizeUring()
 	bUseRegisteredBuffers = false;
 #endif
 	
-	if (GUseDirectIO || bUseRegisteredBuffers)
+	TArray<FFileIoStoreBuffer*> FreeBuffers;
+	while (FFileIoStoreBuffer* Buffer = BufferAllocator->AllocBuffer())
 	{
-		// Set up DirectIO or RegisteredBuffers
-		TArray<FFileIoStoreBuffer*> Buffers;
-		while (FFileIoStoreBuffer* Buffer = BufferAllocator->AllocBuffer())
-		{
-			Buffers.Add(Buffer);
-		}
-		
-		Buffers.Sort([](const FFileIoStoreBuffer& A, const FFileIoStoreBuffer& B)
-		{
-			return A.Memory < B.Memory;
-		});
-		check(!Buffers.IsEmpty());
-		
-		NumAllocatedBuffers = Buffers.Num();
-		uint64 BufferSize = BufferAllocator->GetBufferSize();
-		
-		if (GUseDirectIO)
-		{
-			DirectIOFixupOffsets.Reserve(NumAllocatedBuffers);
-			DirectIOBufferAlignment = GDirectIODefaultBufferAlignment;
+		FreeBuffers.Add(Buffer);
+	}
+	check(!FreeBuffers.IsEmpty());
+	
+	FreeBuffers.Sort([](const FFileIoStoreBuffer& A, const FFileIoStoreBuffer& B)
+	{
+		return A.Memory < B.Memory;
+	});
+	NumAllocatedBuffers = FreeBuffers.Num();
+	ActualBufferSize = BufferAllocator->GetBufferSize();
+	
+	AcquiredBufferProperties.Reserve(NumAllocatedBuffers);
+	for (int32 BufferIndex = 0; BufferIndex < NumAllocatedBuffers; BufferIndex++)
+	{
+		AcquiredBufferProperties.Add(FreeBuffers[BufferIndex]);
+	}
+	
+	// Set up DirectIO or/and RegisteredBuffers
+	if (bUseDirectIO)
+	{
+		// This would cause a double free in FFileIoStoreBufferAllocator but luckily for us, they don't free it.
+		FMemory::Free(FreeBuffers[0]->Memory);
 			
-			// This would cause a double free in FFileIoStoreBufferAllocator but luckily for us, they don't free it.
-			FMemory::Free(Buffers[0]->Memory);
-			
-			// Reallocate the buffers with the correct size
-			const uint64 ReadBufferSize = BufferAllocator->GetBufferSize();
-			DirectIOBufferSize = Align(ReadBufferSize + 2 * DirectIOBufferAlignment, DirectIOBufferAlignment);
-			const uint64 TotalSize = DirectIOBufferSize * NumAllocatedBuffers;
-			
-			BufferSize = DirectIOBufferSize;
-			
-			DirectIOBuffer = static_cast<uint8*>(FMemory::Malloc(TotalSize, DirectIOBufferAlignment));
-			for (int64 Index = 0; Index < NumAllocatedBuffers; Index++)
-			{
-				Buffers[Index]->Memory = DirectIOBuffer + Index * DirectIOBufferSize;
-				DirectIOFixupOffsets.Add(Buffers[Index], 0);
-			}
-		}
+		// Reallocate the buffers with the correct size
+		const uint64 ReadBufferSize = BufferAllocator->GetBufferSize();
 		
-		if (GRegisterBuffers)
+		DirectIOBufferAlignment = GDirectIODefaultBufferAlignment;
+		ActualBufferSize = Align(ReadBufferSize + 2 * DirectIOBufferAlignment, DirectIOBufferAlignment);
+		DirectIOBuffer = static_cast<uint8*>(FMemory::Malloc(ActualBufferSize * NumAllocatedBuffers, DirectIOBufferAlignment));
+			
+		for (uint64 Index = 0; Index < NumAllocatedBuffers; Index++)
 		{
-			UpdateRegisteredBuffers(Buffers[0]->Memory, BufferSize, NumAllocatedBuffers);
+			FreeBuffers[Index]->Memory = DirectIOBuffer + Index * ActualBufferSize;
 		}
+	}
 		
-		for (int32 Index = 0; Index < Buffers.Num(); Index++)
-		{
-			BufferAllocator->FreeBuffer(Buffers[Index]); 
-		}
+	if (bUseRegisteredBuffers)
+	{
+		UpdateRegisteredBuffers(FreeBuffers[0]->Memory);
+	}
+		
+	for (int32 Index = 0; Index < FreeBuffers.Num(); Index++)
+	{
+		BufferAllocator->FreeBuffer(FreeBuffers[Index]); 
 	}
 }
 
 bool FLinuxPlatformIoDispatcher::InitializeUring()
 {
+	if (GUseIOPoll) 
+	{
+		auto GetPollQueues = []()
+		{
+			const int32 Handle = open("/sys/module/nvme/parameters/poll_queues", O_RDONLY | O_CLOEXEC);
+			if (Handle == -1)
+			{
+				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to open %s to determine if user has poll queues enabled. Dropping feature."), TEXT("/sys/module/nvme/parameters/poll_queues"));
+				return 0;
+			}
+			
+			char Buffer[32] = {};
+			const ssize_t BytesRead = read(Handle, Buffer, sizeof(Buffer) - 1);
+			close(Handle);
+			
+			if (BytesRead <= 0)
+			{
+				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("User has not configured any nvme poll queues. Dropping feature."));
+				return 0;
+			}
+			
+			return atoi(Buffer);
+		};
+		
+		NumPollQueues = GetPollQueues();
+		if (NumPollQueues <= 0)
+		{
+			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Invalid number of poll queues %d. Dropping feature."), NumPollQueues);
+		}
+		else
+		{
+			bUseIOPoll = true;
+			UE_LOG(LogLinuxPlatformIO, Display, TEXT("IO-Poll Enabled with %d Poll Queues"), NumPollQueues);
+			if (!GUseDirectIO)
+			{
+				GUseDirectIO = true;
+				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Enabling Direct-IO because it's a requirement of IOPoll"));
+			}
+		}
+	}
+	
 	if (const int32 ErrNo = CreateRing(); ErrNo != 0)
 	{
 		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to initialize io_uring. Error %s"), UTF8_TO_TCHAR(strerror(ErrNo)));
@@ -525,10 +591,11 @@ bool FLinuxPlatformIoDispatcher::InitializeUring()
 			{
 				Workers[0] = GIoWqMaxBoundedWorkers > 0 ? GIoWqMaxBoundedWorkers : 0;
 				Workers[1] = GIoWqMaxUnboundedWorkers > 0 ? GIoWqMaxUnboundedWorkers : 0;
-				VERIFY_URING_SAFE(io_uring_register_iowq_max_workers(&Ring, Workers), bCallResult); // Softly enforced
+				VERIFY_URING_SAFE(io_uring_register_iowq_max_workers(&Ring, Workers), bCallResult); // softly enforced
 			}
 		}
 	}
+	
 
 	if (GRegisterBuffers)
 	{
@@ -550,9 +617,7 @@ bool FLinuxPlatformIoDispatcher::InitializeUring()
 			DispatcherBufferMemory->Set(2152); // Set the dispatcher buffer memory greater than 1GB to make sure registration is still working.
 #endif 
 			
-			
 			const uint64 TotalBufferSize = static_cast<uint64>(DispatcherBufferMemory->GetInt()) << 20ull;
-			
 			if (TotalBufferSize > RLimit.rlim_cur)
 			{
 				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Dropping registered buffers for io_uring. Not enough space within locked memory. Has %llu, Needs %llu"), RLimit.rlim_cur, TotalBufferSize);
@@ -562,6 +627,7 @@ bool FLinuxPlatformIoDispatcher::InitializeUring()
 			// DirectIO imposes additional restrictions for memory
 			if (GUseDirectIO)
 			{
+				bUseDirectIO = true;
 				auto DispatcherBufferSizeKB = IConsoleManager::Get().FindConsoleVariable(TEXT("s.IoDispatcherBufferSizeKB"));
 				check(DispatcherBufferSizeKB);
 				
@@ -613,16 +679,15 @@ void FLinuxPlatformIoDispatcher::ProcessCompletionEvent(io_uring_cqe* Completion
 	FFileIoStoreReadRequest* Request = reinterpret_cast<FFileIoStoreReadRequest*>(CompletionEvent->user_data); 
 	Stats->OnFilesystemReadCompleted(Request);
 	
+	FFileIOStoreBufferProperties& Properties = AcquiredBufferProperties.FindChecked(Request->Buffer);
+	
 	if (Request->Size != CompletionEvent->res)
 	{
 		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to complete read request. Code %d, Error %s, Request %p"), -CompletionEvent->res, UTF8_TO_TCHAR(strerror(-CompletionEvent->res)), Request);
 		Request->bFailed = true;
 	}
-	else if (GUseDirectIO)
-	{
-		const uint64 FixupOffset = DirectIOFixupOffsets.FindChecked(Request->Buffer);
-		Request->Buffer->Memory = Request->Buffer->Memory + FixupOffset;
-	}
+	
+	Request->Buffer->Memory = Request->Buffer->Memory + Properties.FixupOffset;
 	
 	CompletedRequests.Add(Request);
 	--NumPendingCompletions;
@@ -631,17 +696,43 @@ void FLinuxPlatformIoDispatcher::ProcessCompletionEvent(io_uring_cqe* Completion
 
 void FLinuxPlatformIoDispatcher::ProcessCompletedRequests()
 {
-	TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::ProcessCompletedRequests);
-	const uint32 Ready = io_uring_peek_batch_cqe(&Ring, CompletedCqesBuffer.GetData(), CompletedCqesBuffer.Num()); // May enter the kernel for GetEvents if we are overflowing.
+	if (NumPendingCompletions > 0)
 	{
-		FScopeLock Lock(&CompletedRequestsCritical);
-		for (uint32 Index = 0; Index < Ready; ++Index)
+		if (bUseIOPoll)
 		{
-			ProcessCompletionEvent(CompletedCqesBuffer[Index]);
+			// If we have any events ready it will return 0 for uring_enter. Avoid the wasted syscall.
+			const uint32 NumEventsReady = io_uring_cq_ready(&Ring);
+			if (NumEventsReady == 0)
+			{
+				// The problem with this part is that kernel will only poll for single bio I/Os.
+				// And there a pretty high chance that we don't ahve single bio I/Os because of the way Unreal Engine generates the pak ucas files.
+				const int32 Available = io_uring_enter(Ring.enter_ring_fd, 0, 0,  bRingRegistered ? IORING_ENTER_GETEVENTS | IORING_ENTER_REGISTERED_RING : IORING_ENTER_GETEVENTS, nullptr);
+				if (Available == 0)
+				{
+					return;
+				}
+			}
+		}
+		
+		const uint32 Ready = io_uring_peek_batch_cqe(&Ring, CompletedCqesBuffer.GetData(), CompletedCqesBuffer.Num()); // May enter the kernel for GetEvents if we are overflowing.
+		if (Ready > 0)
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::ProcessCompletedRequests);
+			{
+				FScopeLock Lock(&CompletedRequestsCritical);
+				for (uint32 Index = 0; Index < Ready; ++Index)
+				{
+					ProcessCompletionEvent(CompletedCqesBuffer[Index]);
+				}
+			}
+			WakeUpDispatcherThreadDelegate->Execute();	
+			io_uring_cq_advance(&Ring, Ready);
+		}
+		else
+		{
+			VERIFY_URING_VALUE(Ready);
 		}
 	}
-	WakeUpDispatcherThreadDelegate->Execute();	
-	io_uring_cq_advance(&Ring, Ready);
 }
 
 void FLinuxPlatformIoDispatcher::WaitAndProcessCompletionRequests(const bool bDrain)
@@ -681,10 +772,8 @@ void FLinuxPlatformIoDispatcher::AllocateDirectMemory(FFileIoStoreReadRequest* R
 	
 	if (UNLIKELY(BlockSize > DirectIOBufferAlignment)) // Reallocate. Should be rare event
 	{
-		UE_LOG(LogLinuxPlatformIO, Display, TEXT("Updating BlockSize from %llu to %llu for Request %p"), DirectIOBufferAlignment, BlockSize, Request);
-		
 		TArray<FFileIoStoreBuffer*> BufferReferences;
-		DirectIOFixupOffsets.GenerateKeyArray(BufferReferences);
+		AcquiredBufferProperties.GenerateKeyArray(BufferReferences);
 		
 		if (BufferReferences.Num() == 1)
 		{
@@ -698,84 +787,77 @@ void FLinuxPlatformIoDispatcher::AllocateDirectMemory(FFileIoStoreReadRequest* R
 				return A.Memory < B.Memory;
 			});
 			
+			// Release old buffer
+			TArray<FFileIoStoreBuffer*> ActiveReferences = BufferReferences;
+			ActiveReferences.Remove(AcquiredBuffer);
 			
-			// Create an entry to pending releases.	
-			TArray<FFileIoStoreBuffer*> Temp = BufferReferences;
-			Temp.Remove(AcquiredBuffer);
-			
-			// Acquire and release the free buffers
+			// Remove free buffers from active references
 			TArray<FFileIoStoreBuffer*> FreeBuffers;
 			while (FFileIoStoreBuffer* Buffer = BufferAllocator->AllocBuffer())
 			{
 				FreeBuffers.Add(Buffer);
+				ActiveReferences.Remove(Buffer);
 			}
 			
 			for (FFileIoStoreBuffer* Buffer : FreeBuffers)
 			{
-				Temp.Remove(Buffer);
 				BufferAllocator->FreeBuffer(Buffer);
 			}
 			
-			if (!NewDirectIOBuffers.IsEmpty()) // Reallocated recently. Remove the references
-			{
-				TArray<FFileIoStoreBuffer*> BuffersToRemove;
-				NewDirectIOBuffers.GenerateKeyArray(BuffersToRemove);
-				
-				for (FFileIoStoreBuffer* Buffer : BuffersToRemove)
-				{
-					Temp.Remove(Buffer);
-				}
-				NewDirectIOBuffers.Reset();
-			}
-			if (Temp.IsEmpty())
+			if (ActiveReferences.IsEmpty())
 			{
 				FMemory::Free(DirectIOBuffer);
 			}
 			else
 			{
 #if TEST_DIRECTIO_REALLOCATE
-				UE_LOG(LogLinuxPlatformIO, Display, TEXT("Adding Pending Release. Num Refs %d, Memory %p"), Temp.Num(), DirectIOBuffer);
+				UE_LOG(LogLinuxPlatformIO, Display, TEXT("Adding pending release %p, References %d"), DirectIOBuffer, ActiveReferences.Num());
 #endif 
-				DirectIOPendingReleases.Add(FPendingMemoryRelease{.References = MoveTemp(Temp), .Memory = DirectIOBuffer});		
+				DirectIOPendingReleases.Add(FPendingMemoryRelease{.References = MoveTemp(ActiveReferences), .Memory = DirectIOBuffer});	
 			}
 		}
 		
 		DirectIOBufferAlignment = BlockSize;
-		DirectIOBufferSize = Align(BufferAllocator->GetBufferSize() + 2 * DirectIOBufferAlignment, DirectIOBufferAlignment);
-		const uint64 TotalSize = DirectIOBufferSize * NumAllocatedBuffers;
-		DirectIOBuffer = static_cast<uint8*>(FMemory::Malloc(TotalSize, DirectIOBufferAlignment));
+		ActualBufferSize = Align(BufferAllocator->GetBufferSize() + 2 * DirectIOBufferAlignment, DirectIOBufferAlignment);
+		DirectIOBuffer = static_cast<uint8*>(FMemory::Malloc(ActualBufferSize * NumAllocatedBuffers, DirectIOBufferAlignment));
 		
-		for (int64 Index = 0; Index < NumAllocatedBuffers; Index++)
+		for (int32 Index = 0; Index < NumAllocatedBuffers; Index++)
 		{
-			uint8* Ptr = DirectIOBuffer + Index * DirectIOBufferSize;
+			uint8* Ptr = DirectIOBuffer + Index * ActualBufferSize;
+			FFileIoStoreBuffer* Buffer = BufferReferences[Index];
+			FFileIOStoreBufferProperties& Properties = AcquiredBufferProperties.FindChecked(Buffer);
 			
 			if (BufferReferences[Index] == AcquiredBuffer)
 			{
 				BufferReferences[Index]->Memory = Ptr;
+				Properties.NewBuffer = nullptr;
+				Properties.FixupOffset = 0;
 			}
 			else
 			{
-				NewDirectIOBuffers.Add(BufferReferences[Index], Ptr);	
+				Properties.NewBuffer = Ptr;
 			}
 		}
 		
-		if (GRegisterBuffers)
+		if (bUseRegisteredBuffers)
 		{
-			UpdateRegisteredBuffers(DirectIOBuffer, DirectIOBufferSize, NumAllocatedBuffers);	
+			UpdateRegisteredBuffers(DirectIOBuffer);	
 		}
 	}
 	else
 	{
-		uint8* NewMemoryStart = nullptr;
-		if (!NewDirectIOBuffers.IsEmpty() && NewDirectIOBuffers.RemoveAndCopyValue(AcquiredBuffer, NewMemoryStart))
+		FFileIOStoreBufferProperties& Properties = AcquiredBufferProperties.FindChecked(AcquiredBuffer);
+		if (Properties.NewBuffer)
 		{
-			AcquiredBuffer->Memory = NewMemoryStart; // Update the memory. Already at the starting position
+			AcquiredBuffer->Memory = Properties.NewBuffer;
+			Properties.NewBuffer = nullptr;
 		}
 		else
 		{
-			const uint64 CurrentOffset = DirectIOFixupOffsets.FindChecked(AcquiredBuffer);	
-			AcquiredBuffer->Memory -= CurrentOffset; // Back to starting position
+			AcquiredBuffer->Memory -= Properties.FixupOffset;
 		}
+		
+		Properties.FixupOffset = 0;
 	}
 	
 	if (UNLIKELY(!DirectIOPendingReleases.IsEmpty()))
@@ -794,160 +876,79 @@ void FLinuxPlatformIoDispatcher::AllocateDirectMemory(FFileIoStoreReadRequest* R
 			}
 		}
 	}
-	
-	// Reset the fixup offset to zero.
-	DirectIOFixupOffsets.Add(AcquiredBuffer, 0);
 }
 
 io_uring_sqe* FLinuxPlatformIoDispatcher::GetSubmissionQueueEvent()
 {
-	TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::GetSubmissionEvent);
-	
 	io_uring_sqe* NextSqe = io_uring_get_sqe(&Ring);
 	if (LIKELY(NextSqe))
 	{
 		return NextSqe;
 	}
-	
-	do
-	{
-		if (GUseSQPollThread)
-		{
-			VERIFY_URING(io_uring_sqring_wait(&Ring));
-		}
-		else
-		{
-			SubmitRequest(nullptr);
-		}
-		NextSqe = io_uring_get_sqe(&Ring);
-	}
-	while (!NextSqe);
-	
-	return NextSqe;
-}
-
-void FLinuxPlatformIoDispatcher::IssueDirectIORequest(FFileIoStoreReadRequest* Request, FLinuxFileHandle* File, io_uring_sqe* SubmissionEvent)
-{
-	TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::IssueDirectIORequest);
-	
-	const uint64 BlockSize = File->GetBlockSize();
-			
-	// Fixup the alignments
-	const uint64 DataOffset = Request->Offset;
-	const uint64 DataSize = Request->Size;
-	const uint64 AlignedOffset = AlignDown(DataOffset, BlockSize);
-	const uint64 AlignedEnd = Align(DataOffset + DataSize, BlockSize);
-			
-	const uint64 AlignedSize = AlignedEnd - AlignedOffset;
-	const uint64 FixupOffset = DataOffset - AlignedOffset;
-	
-	check(DirectIOBufferSize >= AlignedSize);
-	
-	Stats->OnFilesystemReadStarted(Request);
-	
-	if (GRegisterBuffers)
-	{
-		// Segment points to a location in a registered Memory Buffer
-		const int32 BufferIndex = GetRegisteredBufferOffset(Request->Buffer->Memory);
-		check(BufferIndex != INDEX_NONE);
-		
-		SubmissionEvent->buf_index = BufferIndex;
-		SubmissionEvent->opcode = IORING_OP_READ_FIXED;
-	}
 	else
 	{
-		SubmissionEvent->opcode = IORING_OP_READ;
+		TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::GetSubmissionEvent);
+		do
+		{
+			if (GUseSQPollThread)
+			{
+				VERIFY_URING(io_uring_sqring_wait(&Ring));
+			}
+			else
+			{
+				SubmitRequest(nullptr);
+			}
+			NextSqe = io_uring_get_sqe(&Ring);
+		}
+		while (!NextSqe);
+	
+		return NextSqe;
 	}
-	
-	SubmissionEvent->flags = IOSQE_FIXED_FILE | GetPriorityFlags();
-	SubmissionEvent->fd = File->GetHandle();
-	SubmissionEvent->off = AlignedOffset;
-	SubmissionEvent->len = AlignedSize;
-	SubmissionEvent->addr = reinterpret_cast<UPTRINT>(Request->Buffer->Memory + FixupOffset);
-	SubmissionEvent->user_data = reinterpret_cast<UPTRINT>(Request);
-	
-	// Update the segment because the fixup offset has changed. 
-	DirectIOFixupOffsets.Add(Request->Buffer, FixupOffset);
 }
 
-void FLinuxPlatformIoDispatcher::IssueNormalIORequest(FFileIoStoreReadRequest* Request, FLinuxFileHandle* File, io_uring_sqe* SubmissionEvent)
-{
-	TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::IssueNormalIORequest);
-		
-	Stats->OnFilesystemReadStarted(Request);
-	
-	if (GRegisterBuffers)
-	{
-		SubmissionEvent->buf_index = GetRegisteredBufferOffset(Request->Buffer->Memory);
-		SubmissionEvent->opcode = IORING_OP_READ_FIXED;
-	}
-	else
-	{
-		SubmissionEvent->opcode = IORING_OP_READ;
-	}
-		
-	SubmissionEvent->flags = IOSQE_FIXED_FILE | GetPriorityFlags();
-	SubmissionEvent->fd = File->GetHandle();
-	SubmissionEvent->off = Request->Offset;
-	SubmissionEvent->len = Request->Size;
-	SubmissionEvent->addr = reinterpret_cast<uintptr_t>(Request->Buffer->Memory);
-	SubmissionEvent->user_data = reinterpret_cast<UPTRINT>(Request);
-}
+
 
 void FLinuxPlatformIoDispatcher::IssueRequest(FFileIoStoreReadRequest* Request)
 {
 	io_uring_sqe* SubmissionEvent = GetSubmissionQueueEvent();
 	FLinuxFileHandle* FileHandle = reinterpret_cast<FLinuxFileHandle*>(Request->ContainerFilePartition->FileHandle);
 	
-	uint64 FixupOffset = 0;
 	uint64 Offset = Request->Offset;
 	uint64 Size = Request->Size;
+	
+	FFileIOStoreBufferProperties& Properties = AcquiredBufferProperties.FindChecked(Request->Buffer);
 	
 	if (FileHandle->IsDirect())
 	{
 		const uint64 BlockSize = FileHandle->GetBlockSize();
-		const uint64 DataOffset = Offset;
-		const uint64 DataSize = Size;
-		
-		Offset = AlignDown(DataOffset, BlockSize);
+		const uint64 DataOffset = Request->Offset;
+		const uint64 DataSize = Request->Size;
+		const uint64 AlignedOffset = AlignDown(DataOffset, BlockSize);
 		const uint64 AlignedEnd = Align(DataOffset + DataSize, BlockSize);
-			
-		Size = AlignedEnd - Offset;
-		FixupOffset = DataOffset - Offset;
 		
-		DirectIOFixupOffsets.Add(Request->Buffer, FixupOffset);
+		Size = AlignedEnd - AlignedOffset;
+		Properties.FixupOffset = DataOffset - AlignedOffset;
 	}
 	
-	if (GRegisterBuffers)
-	{
-		SubmissionEvent->buf_index = GetRegisteredBufferOffset(Request->Buffer->Memory);
-		SubmissionEvent->opcode = IORING_OP_READ_FIXED;
-	}
-	else
-	{
-		SubmissionEvent->opcode = IORING_OP_READ;
-	}
-	
+	SubmissionEvent->opcode = bUseRegisteredBuffers ? IORING_OP_READ_FIXED : IORING_OP_READ;
+	SubmissionEvent->buf_index = Properties.BufferIndex;
 	SubmissionEvent->flags = IOSQE_FIXED_FILE | GetPriorityFlags();
 	SubmissionEvent->fd = FileHandle->GetHandle();
 	SubmissionEvent->off = Offset;
 	SubmissionEvent->len = Size;
-	SubmissionEvent->addr = reinterpret_cast<UPTRINT>(Request->Buffer->Memory + FixupOffset);
+	SubmissionEvent->addr = reinterpret_cast<UPTRINT>(Request->Buffer->Memory + Properties.FixupOffset);
 	SubmissionEvent->user_data = reinterpret_cast<UPTRINT>(Request);
 	++NumPendingCompletions;
 }
 
 void FLinuxPlatformIoDispatcher::SubmitRequest(FFileIoStoreReadRequest* Request)
 {
-	TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::SubmitRequests);
-	
 	if (GUseSQPollThread)
 	{
 		VERIFY_URING(io_uring_submit(&Ring));
 	}
 	else
 	{
-		// Read section IORING_SETUP_SUBMIT_ALL in https://man7.org/linux/man-pages/man2/io_uring_setup.2.html for more information about submission. 
 		bool bShouldSubmit = Request == nullptr;
 		if (Request)
 		{
@@ -963,7 +964,8 @@ void FLinuxPlatformIoDispatcher::SubmitRequest(FFileIoStoreReadRequest* Request)
 		
 		if (bShouldSubmit)
 		{
-			// Read section IORING_SETUP_SUBMIT_ALL in https://man7.org/linux/man-pages/man2/io_uring_setup.2.html for more information about submission.
+			TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::SubmitRequests);
+			// For information on submission read IORING_SETUP_SUBMIT_ALL section in https://man7.org/linux/man-pages/man2/io_uring_setup.2.html
 			do
 			{
 				const int32 Expected = PendingSubmits.Num();
@@ -980,23 +982,15 @@ void FLinuxPlatformIoDispatcher::SubmitRequest(FFileIoStoreReadRequest* Request)
 					ProcessCompletedRequests();	
 					break;
 				}
-				
 				VERIFY_URING_VALUE(NumSubmitted);
-				
-				if (PendingSubmits.Num() == NumSubmitted)
-				{
-					// All request should have a posted CQE
-					break;
-				}
 				
 				// CQE should've posted for the failed event. Go past it.
 				PendingSubmits.RemoveAt(0, NumSubmitted);
 				for (int32 Index = 0; Index < PendingSubmits.Num(); Index++)
 				{
-					if (GUseDirectIO)
+					if (bUseDirectIO) // Remove the fixup
 					{
-						const int32 Offset = DirectIOFixupOffsets.FindChecked(PendingSubmits[Index]->Buffer);
-						PendingSubmits[Index]->Buffer->Memory -= Offset;
+						PendingSubmits[Index]->Buffer->Memory -= AcquiredBufferProperties.FindChecked(PendingSubmits[Index]->Buffer).FixupOffset;
 					}
 					IssueRequest(PendingSubmits[Index]);
 				}
@@ -1027,6 +1021,10 @@ bool FLinuxPlatformIoDispatcher::StartRequests(FFileIoStoreRequestQueue& Request
 		if (const int32 ErrNo = io_uring_register_ring_fd(&Ring); ErrNo != 1)
 		{
 			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to register ring fd, ErrorCode %d, Error %s"), -ErrNo, UTF8_TO_TCHAR(strerror(-ErrNo)));
+		}
+		else
+		{
+			bRingRegistered = true;
 		}
 	}
 	
@@ -1074,7 +1072,7 @@ bool FLinuxPlatformIoDispatcher::StartRequests(FFileIoStoreRequestQueue& Request
 				continue;
 			}
 			
-			if (GUseDirectIO)
+			if (bUseDirectIO)
 			{
 				AllocateDirectMemory(NextRequest);
 			}

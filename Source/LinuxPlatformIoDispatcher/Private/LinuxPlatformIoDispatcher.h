@@ -35,6 +35,14 @@ struct FPendingMemoryRelease
 };
 
 
+struct FFileIOStoreBufferProperties
+{
+	uint64 FixupOffset = 0;
+	uint8* NewBuffer = nullptr;
+	int32 BufferIndex = 0;
+};
+
+
 
 class FLinuxPlatformIoDispatcher : public IPlatformFileIoStore
 {
@@ -95,9 +103,9 @@ private:
 	
 	void UnregisterFile(class FLinuxFileHandle* File);
 	
-	void UpdateRegisteredBuffers(uint8* Memory, const uint64 SizePerBuffer, const uint64 NumBuffers);
+	void UpdateRegisteredBuffers(uint8* Start);
 	
-	int32 GetRegisteredBufferOffset(const uint8* Memory);
+	void UpdateRegisteredBuffersOffset();
 	
 	void FinalizeUring();
 	
@@ -110,10 +118,6 @@ private:
 	io_uring_sqe* GetSubmissionQueueEvent();
 	
 	void SubmitRequest(FFileIoStoreReadRequest* Request);
-	
-	void IssueNormalIORequest(FFileIoStoreReadRequest* Request, FLinuxFileHandle* File, io_uring_sqe* SubmissionEvent);
-	
-	void IssueDirectIORequest(FFileIoStoreReadRequest* Request, FLinuxFileHandle* File, io_uring_sqe* SubmissionEvent);
 	
 	void IssueRequest(FFileIoStoreReadRequest* Request);
 	
@@ -136,11 +140,10 @@ private:
 	
 	uint8* DirectIOBuffer = nullptr;
 	uint32 DirectIOBufferAlignment = 0;
-	uint64 DirectIOBufferSize = 0;
+	uint64 ActualBufferSize = 0;
 	
 	TArray<FPendingMemoryRelease> DirectIOPendingReleases;
-	TMap<FFileIoStoreBuffer*, uint64> DirectIOFixupOffsets;
-	TMap<FFileIoStoreBuffer*, uint8*> NewDirectIOBuffers;
+	TMap<FFileIoStoreBuffer*, FFileIOStoreBufferProperties> AcquiredBufferProperties;
 
 	FCriticalSection CompletedRequestsCritical;
 	FFileIoStoreReadRequestList CompletedRequests;
@@ -154,15 +157,20 @@ private:
 	TArray<int32> FreeRegisteredFiles;
 	
 	TArray<io_uring_cqe*> CompletedCqesBuffer;
+	
 	FEventRef Event;
 	
 	std::atomic_int NumCompletionEventsAhead = 0;
 	int32 NumPendingCompletions = 0;
 	int32 CurrentAlignment = -1;
 	int32 NumAllocatedBuffers = 0;
+	int32 NumPollQueues = 0;
 	
 	bool bMustEnableRing = true;
 	bool bSubmitAll = true;
 	bool bRingNeedsRegistering = true;
+	bool bRingRegistered = false;
 	bool bUseRegisteredBuffers = false;
+	bool bUseDirectIO = false;
+	bool bUseIOPoll = false;
 };
