@@ -43,7 +43,7 @@ Implementation of io_uring for Unreal Engine. Designed to be used with cooked co
 # Features
 - Has 'Go Faster' button. Enabled with ```SetLoadingPriority```. It forces every request to async punted to a kernel worker thread rather than executed inline. Use carefully as it does increase CPU usage.
 - SQPoll - is slow and doesn't do anything
-- IoPoll - Doesn't work most of the time because of how Linux handles bio / polling
+- IoPoll - Doesn't work most of the time because of way Linux handles bio / polling
 - DirectIO - is slow but interesting.
 - Falls back to the default dispatcher if the platform does not support io_uring.
 
