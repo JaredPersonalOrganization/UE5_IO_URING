@@ -47,6 +47,76 @@ struct __kernel_timespec {
 
 #define UAPI_LINUX_IO_URING_H_SKIP_LINUX_TIME_TYPES_H 1
 
+
+#if __has_include(<linux/nvme_ioctl.h>)
+#include <linux/nvme_ioctl.h>
+
+#ifndef NVME_URING_CMD_IO	
+#define NVME_URING_CMD_IO _IOWR('N', 0x80, struct nvme_uring_cmd)
+// Assumes that if we don't have the macro, we likely don't have the structure.
+struct nvme_uring_cmd {
+	__u8	opcode;
+	__u8	flags;
+	__u16	rsvd1;
+	__u32	nsid;
+	__u32	cdw2;
+	__u32	cdw3;
+	__u64	metadata;
+	__u64	addr;
+	__u32	metadata_len;
+	__u32	data_len;
+	__u32	cdw10;
+	__u32	cdw11;
+	__u32	cdw12;
+	__u32	cdw13;
+	__u32	cdw14;
+	__u32	cdw15;
+	__u32	timeout_ms;
+	__u32   rsvd2;
+};
+#endif 
+
+#ifndef NVME_URING_CMD_IO_VEC
+#define NVME_URING_CMD_IO_VEC	_IOWR('N', 0x81, struct nvme_uring_cmd)
+#endif
+
+#ifndef NVME_URING_CMD_ADMIN
+#define NVME_URING_CMD_ADMIN	_IOWR('N', 0x82, struct nvme_uring_cmd)
+#endif 
+
+#ifndef NVME_URING_CMD_ADMIN_VEC
+#define NVME_URING_CMD_ADMIN_VEC _IOWR('N', 0x83, s
+#endif
+
+#else
+struct nvme_uring_cmd {
+	__u8	opcode;
+	__u8	flags;
+	__u16	rsvd1;
+	__u32	nsid;
+	__u32	cdw2;
+	__u32	cdw3;
+	__u64	metadata;
+	__u64	addr;
+	__u32	metadata_len;
+	__u32	data_len;
+	__u32	cdw10;
+	__u32	cdw11;
+	__u32	cdw12;
+	__u32	cdw13;
+	__u32	cdw14;
+	__u32	cdw15;
+	__u32	timeout_ms;
+	__u32   rsvd2;
+};
+
+#define NVME_URING_CMD_IO	_IOWR('N', 0x80, struct nvme_uring_cmd)
+#define NVME_URING_CMD_IO_VEC	_IOWR('N', 0x81, struct nvme_uring_cmd)
+#define NVME_URING_CMD_ADMIN	_IOWR('N', 0x82, struct nvme_uring_cmd)
+#define NVME_URING_CMD_ADMIN_VEC _IOWR('N', 0x83, struct nvme_uring_cmd)
+
+#endif
+
 // check for open_how
 #if __has_include(<linux/openat2.h>)
 #include <linux/openat2.h>
@@ -58,6 +128,55 @@ struct open_how {
 };	
 #endif
 
+
+#if __has_include(<linux/fiemap.h>)
+#include <linux/fiemap.h>
+#else
+/**
+* struct fiemap_extent - description of one fiemap extent
+* @fe_logical: byte offset of the extent in the file
+* @fe_physical: byte offset of extent on disk
+* @fe_length: length in bytes for this extent
+* @fe_flags: FIEMAP_EXTENT_* flags for this extent
+*/
+struct fiemap_extent {
+	__u64 fe_logical;
+	__u64 fe_physical;
+	__u64 fe_length;
+	/* private: */
+	__u64 fe_reserved64[2];
+	/* public: */
+	__u32 fe_flags;
+	/* private: */
+	__u32 fe_reserved[3];
+};
+
+/**
+ * struct fiemap - file extent mappings
+ * @fm_start: byte offset (inclusive) at which to start mapping (in)
+ * @fm_length: logical length of mapping which userspace wants (in)
+ * @fm_flags: FIEMAP_FLAG_* flags for request (in/out)
+ * @fm_mapped_extents: number of extents that were mapped (out)
+ * @fm_extent_count: size of fm_extents array (in)
+ * @fm_extents: array of mapped extents (out)
+ */
+struct fiemap {
+	__u64 fm_start;
+	__u64 fm_length;
+	__u32 fm_flags;
+	__u32 fm_mapped_extents;
+	__u32 fm_extent_count;
+	/* private: */
+	__u32 fm_reserved;
+	/* public: */
+	struct fiemap_extent fm_extents[];
+};
+
+
+#endif
+
+
+#define NVME_CMD_READ 0x02
 
 #if !__has_include(<linux/futex.h>)
 #include <inttypes.h>

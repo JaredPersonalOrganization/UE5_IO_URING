@@ -43,6 +43,30 @@ struct FFileIOStoreBufferProperties
 };
 
 
+struct FNvmeRequest
+{
+	FFileIoStoreReadRequest* Request = nullptr;
+	int32 RemainingRequests = 0;
+	uint32 ExpectedLbas = 0;
+};
+
+
+enum class EUringFlags
+{
+	EnableRing = (1 << 0),
+	SubmitAll = (1 << 1),
+	RegisterRing = (1 << 2),
+	RegisterBuffers = (1 << 3),
+	DirectIO = (1 << 4),
+	IOPoll = (1 << 5),
+	NvmeDirect = (1 << 6),
+	
+	Default = RegisterRing | EnableRing | SubmitAll,
+};
+
+ENUM_CLASS_FLAGS(EUringFlags);
+
+
 
 class FLinuxPlatformIoDispatcher : public IPlatformFileIoStore
 {
@@ -95,7 +119,7 @@ public:
 private:
 	uint8 GetPriorityFlags() const;
 	
-	bool OpenFile(FFileIoStoreReadRequest* Request);
+	int32 OpenFile(FFileIoStoreReadRequest* Request);
 	
 	void ProcessCompletedRequests();
 	
@@ -113,13 +137,25 @@ private:
 	
 	int32 CreateRing();
 	
-	void AllocateDirectMemory(FFileIoStoreReadRequest* Request);
+	int32 RegisterNvmeFile(class FLinuxFileHandle* File);
+	
+	void UnregisterNvmeFile(class FLinuxFileHandle* File);
+	
+	void UpdateMemory(const uint64 BlockSize);
+	
+	void AllocateMemory(FFileIoStoreReadRequest* Request, const int32 NvmeDeviceIndex);
 	
 	io_uring_sqe* GetSubmissionQueueEvent();
 	
+	FFileIoStoreReadRequest* GetNextRequest(FFileIoStoreRequestQueue& RequestQueue);
+	
 	void SubmitRequest(FFileIoStoreReadRequest* Request);
 	
-	void IssueRequest(FFileIoStoreReadRequest* Request);
+	void PrepareRequestNvme(FFileIoStoreReadRequest* Request, const int32 NvmeDeviceIndex);
+	
+	void PrepareRequestNormal(FFileIoStoreReadRequest* Request);
+	
+	void IssueRequest(FFileIoStoreReadRequest* Request, const int32 NvmeDeviceIndex);
 	
 	void ProcessCompletionEvent(io_uring_cqe* CompletionEvent);
 	
@@ -136,10 +172,13 @@ private:
 	FFileIoStoreStats* Stats = nullptr;
 	FFileIoStoreBuffer* AcquiredBuffer = nullptr;
 	
+	TArray<TUniquePtr<class FNvmeDevice>> RegisteredNvmeDevices;
+	TArray<FNvmeRequest*> NvmeRequestPool;
+	
 	io_uring Ring = {};
 	
 	uint8* DirectIOBuffer = nullptr;
-	uint32 DirectIOBufferAlignment = 0;
+	uint32 BufferAlignment = 0;
 	uint64 ActualBufferSize = 0;
 	
 	TArray<FPendingMemoryRelease> DirectIOPendingReleases;
@@ -166,11 +205,5 @@ private:
 	int32 NumAllocatedBuffers = 0;
 	int32 NumPollQueues = 0;
 	
-	bool bMustEnableRing = true;
-	bool bSubmitAll = true;
-	bool bRingNeedsRegistering = true;
-	bool bRingRegistered = false;
-	bool bUseRegisteredBuffers = false;
-	bool bUseDirectIO = false;
-	bool bUseIOPoll = false;
+	EUringFlags Flags = EUringFlags::Default;
 };

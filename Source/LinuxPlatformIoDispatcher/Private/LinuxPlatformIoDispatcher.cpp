@@ -2,11 +2,13 @@
 
 #include <netinet/ip.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
-
 #include "IPlatformFilePak.h"
 #include "LinuxFileHandle.h"
 #include "LinuxPlatformIoDispatcherModule.h"
+#include "NvmeDevice.h"
+#include "HAL/PlatformFileManager.h"
 #include "Misc/FileHelper.h"
 #include "uring/int_flags.h"
 #include "uring/liburing.h"
@@ -24,7 +26,7 @@ bool GUseSQPollThread = false;
 static FAutoConsoleVariableRef CVarSQPollThread(
 	TEXT("r.Linux.Streaming.UseSQPollThread"),
 	GUseSQPollThread,
-	TEXT("Whether to use a SQPoll thread. This isn't a free performance switch. Currently it makes the performance worse.\n"),
+	TEXT("Whether to use a SQPoll thread. This isn't a free performance switch. Currently makes the performance worse.\n"),
 	ECVF_ReadOnly
 );
 
@@ -52,11 +54,19 @@ static FAutoConsoleVariableRef CVarUseIOPoll(
 	ECVF_ReadOnly
 );
 
-int32 GDirectIODefaultBufferAlignment = 4096;
+bool GUseNvmeDirect= false;
+static FAutoConsoleVariableRef CVarUseNvmeDirect(
+	TEXT("r.Linux.Streaming.UseNvmeDirect"),
+	GUseNvmeDirect,
+	TEXT("Whether use Nnvme commands directly with io_uring. Experimental."),
+	ECVF_ReadOnly
+);
+
+int32 GIODefaultBufferAlignment = 4096;
 static FAutoConsoleVariableRef CVarDirectIODefaultBufferAlignment(
-	TEXT("r.Linux.Streaming.DirectIOBufferAlignment"),
-	GDirectIODefaultBufferAlignment,
-	TEXT("Default alignment to for DirectIO buffers in bytes. Increases automatically if a larger alignment is required."),
+	TEXT("r.Linux.Streaming.DefaultBufferAlignment"),
+	GIODefaultBufferAlignment,
+	TEXT("This value can different meanings. When used with DirectIO it represents optimal read size, when used with NvmeDirect it represents the logical block size. For both of these, it will increase if necessary."),
 	ECVF_ReadOnly
 );
 
@@ -71,7 +81,7 @@ static FAutoConsoleVariableRef CVarMaxOpenFiles(
 int32 GQueueDepth = -1;
 static FAutoConsoleVariableRef CVarQueueDepth(
 	TEXT("r.Linux.Streaming.QueueDepth"),
-	GMaxNumOpenFiles,
+	GQueueDepth,
 	TEXT("Sets the queue depth of the submission queue entries. Default matches the number of read buffers.\n"),
 	ECVF_ReadOnly
 );
@@ -125,26 +135,33 @@ static FAutoConsoleVariableRef CVarIoWqMaxUnboundedWorkers(
 	} \
 }
 
-#define VERIFY_URING_SAFE(Function, StoredResult) \
+#define VERIFY_URING_SAFE(Function) \
 { \
-	StoredResult = true; \
 	const int32 UringFunctionResult = Function; \
 	if(UNLIKELY(UringFunctionResult < 0)) \
 	{  \
-		StoredResult = false; \
+		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("IoUring Error %s, Code %d, Function %s, File %s, Line %u"), UTF8_TO_TCHAR(strerror(-UringFunctionResult)), -UringFunctionResult, UTF8_TO_TCHAR(#Function), UTF8_TO_TCHAR(__FILE__), __LINE__); \
+		return false; \
+	} \
+}
+
+#define VERIFY_URING_SAFE_NO_RET(Function) \
+{ \
+	const int32 UringFunctionResult = Function; \
+	if(UNLIKELY(UringFunctionResult < 0)) \
+	{  \
 		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("IoUring Error %s, Code %d, Function %s, File %s, Line %u"), UTF8_TO_TCHAR(strerror(-UringFunctionResult)), -UringFunctionResult, UTF8_TO_TCHAR(#Function), UTF8_TO_TCHAR(__FILE__), __LINE__); \
 	} \
 }
 
-#define VERIFY_LINUX_SAFE(Function, StoredResult) \
+// Calls Linux function. On -1 logs error and returns false
+#define VERIFY_LINUX_SAFE(Function) \
 { \
-	StoredResult = true; \
 	const int32 LinuxFunctionResult = Function; \
 	if(UNLIKELY(LinuxFunctionResult == -1)) \
 	{ \
-		StoredResult = false; \
-		const int32 ErrNo = errno; \
-		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Linux Error %s, Code %d, Function %s, File %s, Line %u"), UTF8_TO_TCHAR(strerror(ErrNo)), ErrNo, UTF8_TO_TCHAR(#Function), UTF8_TO_TCHAR(__FILE__), __LINE__); \
+		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Linux Error %s, Code %d, Function %s, File %s, Line %u"), UTF8_TO_TCHAR(strerror(errno)), errno, UTF8_TO_TCHAR(#Function), UTF8_TO_TCHAR(__FILE__), __LINE__); \
+		return false; \
 	} \
 }
 
@@ -170,6 +187,11 @@ FLinuxPlatformIoDispatcher::~FLinuxPlatformIoDispatcher()
 	// We can't free DirectIOBuffer because we don't know the lifetime
 	io_uring_unregister_buffers(&Ring);
 	io_uring_queue_exit(&Ring);
+	
+	for (const FNvmeRequest* Request : NvmeRequestPool)
+	{
+		delete Request;
+	}
 }
 	
 void FLinuxPlatformIoDispatcher::Initialize(const FInitializePlatformFileIoStoreParams& Params)
@@ -186,37 +208,98 @@ void FLinuxPlatformIoDispatcher::RegisterFile(class FLinuxFileHandle* File)
 	checkf(!FreeRegisteredFiles.IsEmpty(), TEXT("Ran out of registered files!"));
 	check(File->GetState() == FLinuxFileHandle::Opened);
 			
-	const int32 FixedHandle = FreeRegisteredFiles.Pop(EAllowShrinking::No);
-	const int32 Fd = File->GetHandle();
+	const int32 FixedFd = FreeRegisteredFiles.Pop(EAllowShrinking::No);
+	const int32 Fd = File->GetFd();
 	
-	VERIFY_URING(io_uring_register_files_update(&Ring, FixedHandle, &Fd, 1));
+	VERIFY_URING(io_uring_register_files_update(&Ring, FixedFd, &Fd, 1));
 	
 	File->Close(); 
-	File->UpdateHandle(FixedHandle, FLinuxFileHandle::Fixed);
+	File->UpdateFd(FixedFd, FLinuxFileHandle::Fixed);
 }
 
 void FLinuxPlatformIoDispatcher::UnregisterFile(class FLinuxFileHandle* File)
 {
-	if (File->GetState() == FLinuxFileHandle::Fixed)
+	if (EnumHasAnyFlags(Flags, EUringFlags::NvmeDirect))
+	{
+		UnregisterNvmeFile(File);
+	}
+	else if (File->GetState() == FLinuxFileHandle::Fixed)
 	{
 		constexpr int32 NewFd = -1;
-		const int32 FixedHandle = File->GetHandle();
-		VERIFY_URING(io_uring_register_files_update(&Ring, FixedHandle, &NewFd, 1));
-		FreeRegisteredFiles.Add(FixedHandle);
+		const int32 FixedFd = File->GetFd();
+		VERIFY_URING(io_uring_register_files_update(&Ring, FixedFd, &NewFd, 1));
+		FreeRegisteredFiles.Add(FixedFd);
 	}
 	delete File;
 }
+
+void FLinuxPlatformIoDispatcher::UnregisterNvmeFile(class FLinuxFileHandle* File)
+{
+	const int32 FoundDevice = RegisteredNvmeDevices.IndexOfByPredicate([Pid = File->GetDevice()](const TUniquePtr<FNvmeDevice>& NvmeDevice) { return NvmeDevice->GetDeviceId() == Pid; });
+	if (FoundDevice != INDEX_NONE)
+	{
+		RegisteredNvmeDevices[FoundDevice]->UnregisterContainer(File);
+		
+		if (RegisteredNvmeDevices[FoundDevice]->ShouldRemove())
+		{
+			const int32 FixedFd = RegisteredNvmeDevices[FoundDevice]->GetFixedFd();
+			if (FixedFd != INDEX_NONE)
+			{
+				constexpr int32 NewFd = -1;
+				VERIFY_URING(io_uring_register_files_update(&Ring, FixedFd, &NewFd, 1));
+				FreeRegisteredFiles.Add(FixedFd);
+			}
+			RegisteredNvmeDevices.RemoveAt(FoundDevice);
+		}
+	}
+}
+
+int32 FLinuxPlatformIoDispatcher::RegisterNvmeFile(class FLinuxFileHandle* File)
+{
+	const int32 FoundDevice = RegisteredNvmeDevices.IndexOfByPredicate([Pid = File->GetDevice()](const TUniquePtr<FNvmeDevice>& NvmeDevice) { return NvmeDevice->GetDeviceId() == Pid; });
+	if (FoundDevice != INDEX_NONE)
+	{
+		if (!RegisteredNvmeDevices[FoundDevice]->RegisterContainer(File))
+		{
+			return INDEX_NONE;
+		}
+		return FoundDevice;
+	}
 	
+	if (TUniquePtr<FNvmeDevice> NvmeDevice = FNvmeDevice::Create(File->GetDevice()))
+	{
+		if (NvmeDevice->RegisterContainer(File))
+		{
+			checkf(!FreeRegisteredFiles.IsEmpty(), TEXT("Ran out of registered files!"));
+			
+			const int32 FixedFd = FreeRegisteredFiles.Pop(EAllowShrinking::No);
+			const int32 Fd = NvmeDevice->GetFd();
+			
+			VERIFY_URING(io_uring_register_files_update(&Ring, FixedFd, &Fd, 1));
+			
+			NvmeDevice->SetFixedFd(FixedFd);
+			
+			return RegisteredNvmeDevices.Add(MoveTemp(NvmeDevice));
+		}
+	}
+	
+	return INDEX_NONE;
+}
+
 bool FLinuxPlatformIoDispatcher::OpenContainer(const TCHAR* ContainerFilePath, uint64& ContainerFileHandle, uint64& ContainerFileSize)
 {
-	if (FLinuxFileHandle* Handle = FLinuxFileHandle::CreateFileHandle(ContainerFilePath, bUseDirectIO))
+	FLinuxFileHandle* Handle = FLinuxFileHandle::CreateFileHandle(ContainerFilePath, EnumHasAnyFlags(Flags, EUringFlags::DirectIO));
+	if (!Handle)
 	{
-		Handle->Close(); 
-		ContainerFileSize = Handle->GetSize();
-		ContainerFileHandle = reinterpret_cast<UPTRINT>(Handle);
-		return true;
+		return false;
 	}
-	return false;
+	
+	// We let the dedicated thread register the files, because we don't control the process limits, and fixed files count towards the user limits.
+	Handle->Close(); 
+	ContainerFileSize = Handle->GetSize();
+	ContainerFileHandle = reinterpret_cast<UPTRINT>(Handle);
+	
+	return true;
 }
 	
 void FLinuxPlatformIoDispatcher::CloseContainer(uint64 ContainerFileHandle)
@@ -237,19 +320,24 @@ uint8 FLinuxPlatformIoDispatcher::GetPriorityFlags() const
 	return Priority == EDispatcherPriority::High ? IOSQE_ASYNC : 0;
 }
 
-bool FLinuxPlatformIoDispatcher::OpenFile(FFileIoStoreReadRequest* Request)
+int32 FLinuxPlatformIoDispatcher::OpenFile(FFileIoStoreReadRequest* Request)
 {
 	check(Request->ContainerFilePartition->FileHandle);
 	FLinuxFileHandle* FileHandle = reinterpret_cast<FLinuxFileHandle*>(Request->ContainerFilePartition->FileHandle);
-	if (FileHandle->GetState() != FLinuxFileHandle::Fixed)
+	
+	if (EnumHasAnyFlags(Flags, EUringFlags::NvmeDirect))
+	{
+		return RegisterNvmeFile(FileHandle);
+	}
+	else if (FileHandle->GetState() != FLinuxFileHandle::Fixed)
 	{
 		if (!FileHandle->Open())
 		{
-			return false;
+			return INDEX_NONE;
 		}
-		RegisterFile(FileHandle); 
+		RegisterNvmeFile(FileHandle);
 	}
-	return true;
+	return 0;
 }
 	
 bool FLinuxPlatformIoDispatcher::CreateCustomRequests(FFileIoStoreResolvedRequest& ResolvedRequest, FFileIoStoreReadRequestList& OutRequests)
@@ -370,11 +458,17 @@ int32 FLinuxPlatformIoDispatcher::CreateRing()
 #endif
 		Params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SUBMIT_ALL;
 		Params.sq_thread_idle = GSQPollIdleTimeMS;
-		bMustEnableRing = false;
 		
-		if (bUseIOPoll)
+		EnumRemoveFlags(Flags, EUringFlags::RegisterRing);
+		
+		if (EnumHasAnyFlags(Flags, EUringFlags::IOPoll))
 		{
 			Params.flags |= IORING_SETUP_IOPOLL;
+		}
+		
+		if (EnumHasAnyFlags(Flags, EUringFlags::NvmeDirect))
+		{
+			Params.flags |= IORING_SETUP_SQE128 | IORING_SETUP_CQE32; // Required flags. Will not drop them.
 		}
 		
 		if (io_uring_queue_init_params(MaxPendingRequests, &Ring, &Params) == 0)
@@ -382,8 +476,8 @@ int32 FLinuxPlatformIoDispatcher::CreateRing()
 			return 0;
 		}
 		
+		EnumRemoveFlags(Flags, EUringFlags::SubmitAll);
 		Params.flags &= ~IORING_SETUP_SUBMIT_ALL;
-		bSubmitAll = false;
 		return io_uring_queue_init_params(MaxPendingRequests, &Ring, &Params);
 	}
 	else
@@ -397,9 +491,14 @@ int32 FLinuxPlatformIoDispatcher::CreateRing()
 		
 		Params.flags = IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_R_DISABLED;
 		
-		if (bUseIOPoll)
+		if (EnumHasAnyFlags(Flags, EUringFlags::IOPoll))
 		{
 			Params.flags |= IORING_SETUP_IOPOLL;
+		}
+		
+		if (EnumHasAnyFlags(Flags, EUringFlags::NvmeDirect))
+		{
+			Params.flags |= IORING_SETUP_SQE128 | IORING_SETUP_CQE32; // Required flags. Will not drop them.
 		}
 		
 		if (io_uring_queue_init_params(MaxPendingRequests, &Ring, &Params) == 0)
@@ -426,9 +525,8 @@ int32 FLinuxPlatformIoDispatcher::CreateRing()
 		}
 		
 		// TODO: Is it even worth creating a ring at this point? We need to check the performance.
+		EnumRemoveFlags(Flags, EUringFlags::SubmitAll);
 		Params.flags &= ~IORING_SETUP_SUBMIT_ALL;
-
-		bSubmitAll = false;
 		return io_uring_queue_init_params(MaxPendingRequests, &Ring, &Params);
 	}
 }
@@ -459,18 +557,18 @@ void FLinuxPlatformIoDispatcher::FinalizeUring()
 		AcquiredBufferProperties.Add(FreeBuffers[BufferIndex]);
 	}
 	
-	// Set up DirectIO or/and RegisteredBuffers
-	if (bUseDirectIO)
+	if (EnumHasAnyFlags(Flags, EUringFlags::DirectIO | EUringFlags::NvmeDirect))
 	{
-		// This would cause a double free in FFileIoStoreBufferAllocator but luckily for us, they don't free it.
 		FMemory::Free(FreeBuffers[0]->Memory);
 			
 		// Reallocate the buffers with the correct size
 		const uint64 ReadBufferSize = BufferAllocator->GetBufferSize();
 		
-		DirectIOBufferAlignment = GDirectIODefaultBufferAlignment;
-		ActualBufferSize = Align(ReadBufferSize + 2 * DirectIOBufferAlignment, DirectIOBufferAlignment);
-		DirectIOBuffer = static_cast<uint8*>(FMemory::Malloc(ActualBufferSize * NumAllocatedBuffers, DirectIOBufferAlignment));
+		BufferAlignment = GIODefaultBufferAlignment;
+		ActualBufferSize = Align(ReadBufferSize + 2 * BufferAlignment, BufferAlignment);
+		DirectIOBuffer = static_cast<uint8*>(FMemory::Malloc(ActualBufferSize * NumAllocatedBuffers, BufferAlignment));
+		
+		FMemory::Memzero(DirectIOBuffer, ActualBufferSize * NumAllocatedBuffers);
 			
 		for (uint64 Index = 0; Index < NumAllocatedBuffers; Index++)
 		{
@@ -478,7 +576,7 @@ void FLinuxPlatformIoDispatcher::FinalizeUring()
 		}
 	}
 		
-	if (bUseRegisteredBuffers)
+	if (EnumHasAnyFlags(Flags, EUringFlags::RegisterBuffers))
 	{
 		UpdateRegisteredBuffers(FreeBuffers[0]->Memory);
 	}
@@ -489,46 +587,53 @@ void FLinuxPlatformIoDispatcher::FinalizeUring()
 	}
 }
 
+
+void AddFlags(EUringFlags& Flags)
+{
+	uint8 FlagsToAdd = 0;
+	if (GUseIOPoll)
+	{
+		FlagsToAdd |=  static_cast<uint8>(EUringFlags::IOPoll);
+	}
+	if (GUseNvmeDirect) // NVME commands removes this flag
+	{
+		FlagsToAdd |=  static_cast<uint8>(EUringFlags::NvmeDirect);
+	}
+	if (GUseDirectIO)
+	{
+		FlagsToAdd |=  static_cast<uint8>(EUringFlags::DirectIO);
+	}
+	if (GRegisterBuffers)
+	{
+		FlagsToAdd |= static_cast<uint8>(EUringFlags::RegisterBuffers);
+	}
+	
+	EnumAddFlags(Flags, static_cast<EUringFlags>(FlagsToAdd));
+}
+
+
 bool FLinuxPlatformIoDispatcher::InitializeUring()
 {
-	if (GUseIOPoll) 
+	// Add the flags
+	AddFlags(Flags);
+	
+	if (EnumHasAnyFlags(Flags, EUringFlags::IOPoll)) 
 	{
-		auto GetPollQueues = []()
+		FString Contents;
+		if (!ReadFileContents(TEXT("/sys/module/nvme/parameters/poll_queues"), Contents))
 		{
-			const int32 Handle = open("/sys/module/nvme/parameters/poll_queues", O_RDONLY | O_CLOEXEC);
-			if (Handle == -1)
-			{
-				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to open %s to determine if user has poll queues enabled. Dropping feature."), TEXT("/sys/module/nvme/parameters/poll_queues"));
-				return 0;
-			}
-			
-			char Buffer[32] = {};
-			const ssize_t BytesRead = read(Handle, Buffer, sizeof(Buffer) - 1);
-			close(Handle);
-			
-			if (BytesRead <= 0)
-			{
-				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("User has not configured any nvme poll queues. Dropping feature."));
-				return 0;
-			}
-			
-			return atoi(Buffer);
-		};
-		
-		NumPollQueues = GetPollQueues();
-		if (NumPollQueues <= 0)
+			EnumRemoveFlags(Flags, EUringFlags::IOPoll);
+			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Dropping IOPoll Feature"));
+		}
+		else if ((NumPollQueues = atoi(TCHAR_TO_UTF8(*Contents))) <= 0)
 		{
-			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Invalid number of poll queues %d. Dropping feature."), NumPollQueues);
+			EnumRemoveFlags(Flags, EUringFlags::IOPoll);
+			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Invalid number of poll queues %d. Dropping IOPoll."), NumPollQueues);
 		}
 		else
 		{
-			bUseIOPoll = true;
 			UE_LOG(LogLinuxPlatformIO, Display, TEXT("IO-Poll Enabled with %d Poll Queues"), NumPollQueues);
-			if (!GUseDirectIO)
-			{
-				GUseDirectIO = true;
-				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Enabling Direct-IO because it's a requirement of IOPoll"));
-			}
+			EnumAddFlags(Flags, EUringFlags::DirectIO); // Direct IO is required. Will be ignored if NvmeDirect is enabled.
 		}
 	}
 	
@@ -553,16 +658,11 @@ bool FLinuxPlatformIoDispatcher::InitializeUring()
 	
 	CompletedCqesBuffer.SetNum(Ring.cq.ring_entries);
 	
-	bool bCallResult = true;
 	
 	// Set up registered files.
 	{
 		rlimit RLimit;
-		VERIFY_LINUX_SAFE(getrlimit(RLIMIT_NOFILE, &RLimit), bCallResult)
-		if (!bCallResult)
-		{
-			return bCallResult;
-		}
+		VERIFY_LINUX_SAFE(getrlimit(RLIMIT_NOFILE, &RLimit));
 		
 		TArray<int32> SparseHandles;
 		SparseHandles.SetNum(FMath::Min<int32>(RLimit.rlim_cur, GMaxNumOpenFiles));
@@ -572,15 +672,12 @@ bool FLinuxPlatformIoDispatcher::InitializeUring()
 			FreeRegisteredFiles.Add(Index);
 		}
 		
-		VERIFY_URING_SAFE(io_uring_register_files(&Ring, SparseHandles.GetData(), SparseHandles.Num()), bCallResult)
-		if (!bCallResult)
-		{
-			return bCallResult;
-		}
+		VERIFY_URING_SAFE(io_uring_register_files(&Ring, SparseHandles.GetData(), SparseHandles.Num()))
 		
-		Algo::Reverse(SparseHandles);
+		Algo::Reverse(FreeRegisteredFiles);
 	}
 	
+	// Setup unbound/bounded workers
 	{
 		uint32 Workers[2] = {0, 0};
 		const int32 Result = io_uring_register_iowq_max_workers(&Ring, Workers);
@@ -591,71 +688,54 @@ bool FLinuxPlatformIoDispatcher::InitializeUring()
 			{
 				Workers[0] = GIoWqMaxBoundedWorkers > 0 ? GIoWqMaxBoundedWorkers : 0;
 				Workers[1] = GIoWqMaxUnboundedWorkers > 0 ? GIoWqMaxUnboundedWorkers : 0;
-				VERIFY_URING_SAFE(io_uring_register_iowq_max_workers(&Ring, Workers), bCallResult); // softly enforced
+				VERIFY_URING_SAFE_NO_RET(io_uring_register_iowq_max_workers(&Ring, Workers)); 
 			}
 		}
 	}
 	
-
-	if (GRegisterBuffers)
+	if (EnumHasAnyFlags(Flags, EUringFlags::RegisterBuffers))
 	{
-		// Get RLIMIT_MEMLOCK.
-		bUseRegisteredBuffers = true;
 		rlimit RLimit;
-		VERIFY_LINUX_SAFE(getrlimit(RLIMIT_MEMLOCK, &RLimit), bCallResult);
-		if (!bCallResult)
-		{
-			bUseRegisteredBuffers = false;
-		}
-		else
-		{
-			// Check if we have enough space to fit registered buffers
-			auto DispatcherBufferMemory = IConsoleManager::Get().FindConsoleVariable(TEXT("s.IoDispatcherBufferMemoryMB"));
-			check(DispatcherBufferMemory);
-			
+		VERIFY_LINUX_SAFE(getrlimit(RLIMIT_MEMLOCK, &RLimit));
+		
+		// Check if we have enough space to fit registered buffers
+		auto DispatcherBufferMemory = IConsoleManager::Get().FindConsoleVariable(TEXT("s.IoDispatcherBufferMemoryMB"));
+		check(DispatcherBufferMemory);
+		
 #if TEST_LARGE_BUFFER_SIZES
-			DispatcherBufferMemory->Set(2152); // Set the dispatcher buffer memory greater than 1GB to make sure registration is still working.
+		DispatcherBufferMemory->Set(2152); // Set the dispatcher buffer memory greater than 1GB to ensure registeration is working
 #endif 
+		
+		const uint64 TotalBufferSize = static_cast<uint64>(DispatcherBufferMemory->GetInt()) << 20ull;
+		
+		if (TotalBufferSize > RLimit.rlim_cur)
+		{
+			EnumRemoveFlags(Flags, EUringFlags::RegisterBuffers);
+			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Dropping registered buffers for io_uring. Not enough space within locked memory. Has %llu, Needs %llu"), RLimit.rlim_cur, TotalBufferSize);
+		}
+		else if (EnumHasAnyFlags(Flags, EUringFlags::NvmeDirect))
+		{
+			auto DispatcherBufferSizeKB = IConsoleManager::Get().FindConsoleVariable(TEXT("s.IoDispatcherBufferSizeKB"));
+			check(DispatcherBufferSizeKB);
 			
-			const uint64 TotalBufferSize = static_cast<uint64>(DispatcherBufferMemory->GetInt()) << 20ull;
-			if (TotalBufferSize > RLimit.rlim_cur)
-			{
-				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Dropping registered buffers for io_uring. Not enough space within locked memory. Has %llu, Needs %llu"), RLimit.rlim_cur, TotalBufferSize);
-				bUseRegisteredBuffers = false;
-			}
+			const uint64 ReadBufferSize = static_cast<uint64>(DispatcherBufferSizeKB->GetInt()) << 10ull;
+			const uint64 BufferCount = TotalBufferSize / ReadBufferSize;
 			
-			// DirectIO imposes additional restrictions for memory
-			if (GUseDirectIO)
-			{
-				bUseDirectIO = true;
-				auto DispatcherBufferSizeKB = IConsoleManager::Get().FindConsoleVariable(TEXT("s.IoDispatcherBufferSizeKB"));
-				check(DispatcherBufferSizeKB);
+		}
+		else if (EnumHasAnyFlags(Flags, EUringFlags::DirectIO)) // DirectIO requires more locked memory
+		{
+			auto DispatcherBufferSizeKB = IConsoleManager::Get().FindConsoleVariable(TEXT("s.IoDispatcherBufferSizeKB"));
+			check(DispatcherBufferSizeKB);
 				
-				const uint64 ReadBufferSize = static_cast<uint64>(DispatcherBufferSizeKB->GetInt()) << 10ull;
-				const uint64 BufferCount = TotalBufferSize / ReadBufferSize;
-				constexpr uint64 MaximumBlockSize = 65536; // Test for the largest size.
-				const uint64 AlignedSize = Align(ReadBufferSize + 2 * MaximumBlockSize, MaximumBlockSize);
+			const uint64 ReadBufferSize = static_cast<uint64>(DispatcherBufferSizeKB->GetInt()) << 10ull;
+			const uint64 BufferCount = TotalBufferSize / ReadBufferSize;
+			constexpr uint64 MaximumBlockSize = 65536; // Test for the largest size.
+			const uint64 AlignedSize = Align(ReadBufferSize + 2 * MaximumBlockSize, MaximumBlockSize);
 				
-				if (AlignedSize * BufferCount > RLimit.rlim_cur)
-				{
-					UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Dropping registered buffers io_uring. Not enough space within locked memory. Has %llu, Needs %llu"), RLimit.rlim_cur, AlignedSize * BufferCount);
-					bUseRegisteredBuffers = false;
-				}
-			}
-			
-			if (bUseRegisteredBuffers)
+			if (AlignedSize * BufferCount > RLimit.rlim_cur)
 			{
-				char Data[1024];
-				iovec Dummy {.iov_base = Data, .iov_len = sizeof(Data)};
-				VERIFY_URING_SAFE(io_uring_register_buffers(&Ring, &Dummy, 1), bCallResult);
-				if (!bCallResult)
-				{
-					bUseRegisteredBuffers = false;
-				}
-				else
-				{
-					io_uring_unregister_buffers(&Ring);
-				}
+				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Dropping registered buffers io_uring. Not enough space within locked memory. Has %llu, Needs %llu"), RLimit.rlim_cur, AlignedSize * BufferCount);
+				EnumRemoveFlags(Flags, EUringFlags::RegisterBuffers);
 			}
 		}
 	}
@@ -676,21 +756,56 @@ void FLinuxPlatformIoDispatcher::ProcessCompletionEvent(io_uring_cqe* Completion
 {
 	// Assumes that we have the lock
 	check(CompletionEvent->user_data);
-	FFileIoStoreReadRequest* Request = reinterpret_cast<FFileIoStoreReadRequest*>(CompletionEvent->user_data); 
+	
+	--NumPendingCompletions;
+	
+	FFileIoStoreReadRequest* Request = nullptr;
+	if (EnumHasAnyFlags(Flags, EUringFlags::NvmeDirect))
+	{
+		FNvmeRequest* NvmeRequest = reinterpret_cast<FNvmeRequest*>(CompletionEvent->user_data);
+		if (--NvmeRequest->RemainingRequests != 0)
+		{
+			return;
+		}
+		
+		// Get the request and add it back to the pool
+		Request = NvmeRequest->Request;
+		NvmeRequestPool.Add(NvmeRequest);
+		
+		if (CompletionEvent->res < 0)
+		{
+			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to complete read request. Code %d, Error %s, Request %p"), -CompletionEvent->res, UTF8_TO_TCHAR(strerror(-CompletionEvent->res)), Request);
+			Request->bFailed = true;
+		}
+		
+		const uint64 NvmeResult = CompletionEvent->big_cqe[0];
+		const uint16 Status = (uint16)((NvmeResult >> 16) & 0x7FF);
+		
+		if (Status != 0)
+		{
+			Request->bFailed = true;
+			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to complete read request. Nvme Error Code %u"), (uint32)Status);
+		}
+	}
+	else
+	{
+		Request = reinterpret_cast<FFileIoStoreReadRequest*>(CompletionEvent->user_data);
+		
+		if (Request->Size != CompletionEvent->res)
+		{
+			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to complete read request. Code %d, Error %s, Request %p"), -CompletionEvent->res, UTF8_TO_TCHAR(strerror(-CompletionEvent->res)), Request);
+			Request->bFailed = true;
+		}
+	}
+	
 	Stats->OnFilesystemReadCompleted(Request);
 	
 	FFileIOStoreBufferProperties& Properties = AcquiredBufferProperties.FindChecked(Request->Buffer);
 	
-	if (Request->Size != CompletionEvent->res)
-	{
-		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to complete read request. Code %d, Error %s, Request %p"), -CompletionEvent->res, UTF8_TO_TCHAR(strerror(-CompletionEvent->res)), Request);
-		Request->bFailed = true;
-	}
-	
 	Request->Buffer->Memory = Request->Buffer->Memory + Properties.FixupOffset;
 	
 	CompletedRequests.Add(Request);
-	--NumPendingCompletions;
+	
 	++NumCompletionEventsAhead;
 }
 
@@ -698,19 +813,17 @@ void FLinuxPlatformIoDispatcher::ProcessCompletedRequests()
 {
 	if (NumPendingCompletions > 0)
 	{
-		if (bUseIOPoll)
+		if (EnumHasAnyFlags(Flags, EUringFlags::IOPoll))
 		{
-			// If we have any events ready it will return 0 for uring_enter. Avoid the wasted syscall.
+			// If we have any events available during io_uring_enter it will return 0, so do this to avoid entering the kernel.
 			const uint32 NumEventsReady = io_uring_cq_ready(&Ring);
 			if (NumEventsReady == 0)
 			{
-				// The problem with this part is that kernel will only poll for single bio I/Os.
-				// And there a pretty high chance that we don't ahve single bio I/Os because of the way Unreal Engine generates the pak ucas files.
-				const int32 Available = io_uring_enter(Ring.enter_ring_fd, 0, 0,  bRingRegistered ? IORING_ENTER_GETEVENTS | IORING_ENTER_REGISTERED_RING : IORING_ENTER_GETEVENTS, nullptr);
-				if (Available == 0)
-				{
-					return;
-				}
+				// The big issue with this part is that the kernel will only poll for single bio I/Os.
+				// And there is a high chance that we don't have single bio I/Os.
+				// We are still going to have to enter the kernel to check for it.
+				// All of this doesn't apply for nvme commands.
+				VERIFY_URING(io_uring_enter(Ring.enter_ring_fd, 0, 0,  ring_enter_flags(&Ring) | IORING_ENTER_GETEVENTS, nullptr));
 			}
 		}
 		
@@ -756,21 +869,15 @@ void FLinuxPlatformIoDispatcher::WaitAndProcessCompletionRequests(const bool bDr
 	}
 }
 
-void FLinuxPlatformIoDispatcher::AllocateDirectMemory(FFileIoStoreReadRequest* Request)
+void FLinuxPlatformIoDispatcher::UpdateMemory(const uint64 BlockSize)
 {
-	check(Request->ContainerFilePartition->FileHandle);
-	
-	FLinuxFileHandle* FileHandle = reinterpret_cast<FLinuxFileHandle*>(Request->ContainerFilePartition->FileHandle);
-	
-#if TEST_DIRECTIO_REALLOCATE
+#if TEST_DIRECTIO_REALLOCATE // TODO: Fix me. Const...
 	static uint64 Counter = 0;
 	static uint64 UpdateCounter = FMath::RandRange(1, 50);
 	const uint64 BlockSize =  FMath::Min<uint64>(++Counter % UpdateCounter == 0 ? DirectIOBufferAlignment * 2 : DirectIOBufferAlignment, 65536); // clamp to 64K
-#else 
-	const uint64 BlockSize = FileHandle->IsDirect() ? FileHandle->GetBlockSize() : 0;
 #endif
 	
-	if (UNLIKELY(BlockSize > DirectIOBufferAlignment)) // Reallocate. Should be rare event
+	if (UNLIKELY(BlockSize > BufferAlignment)) // Reallocate. Should be very rare event
 	{
 		TArray<FFileIoStoreBuffer*> BufferReferences;
 		AcquiredBufferProperties.GenerateKeyArray(BufferReferences);
@@ -817,9 +924,9 @@ void FLinuxPlatformIoDispatcher::AllocateDirectMemory(FFileIoStoreReadRequest* R
 			}
 		}
 		
-		DirectIOBufferAlignment = BlockSize;
-		ActualBufferSize = Align(BufferAllocator->GetBufferSize() + 2 * DirectIOBufferAlignment, DirectIOBufferAlignment);
-		DirectIOBuffer = static_cast<uint8*>(FMemory::Malloc(ActualBufferSize * NumAllocatedBuffers, DirectIOBufferAlignment));
+		BufferAlignment = BlockSize;
+		ActualBufferSize = Align(BufferAllocator->GetBufferSize() + 2 * BufferAlignment, BufferAlignment);
+		DirectIOBuffer = static_cast<uint8*>(FMemory::Malloc(ActualBufferSize * NumAllocatedBuffers, BufferAlignment));
 		
 		for (int32 Index = 0; Index < NumAllocatedBuffers; Index++)
 		{
@@ -839,7 +946,7 @@ void FLinuxPlatformIoDispatcher::AllocateDirectMemory(FFileIoStoreReadRequest* R
 			}
 		}
 		
-		if (bUseRegisteredBuffers)
+		if (EnumHasAnyFlags(Flags, EUringFlags::RegisterBuffers))
 		{
 			UpdateRegisteredBuffers(DirectIOBuffer);	
 		}
@@ -847,17 +954,12 @@ void FLinuxPlatformIoDispatcher::AllocateDirectMemory(FFileIoStoreReadRequest* R
 	else
 	{
 		FFileIOStoreBufferProperties& Properties = AcquiredBufferProperties.FindChecked(AcquiredBuffer);
-		if (Properties.NewBuffer)
+		if (UNLIKELY(Properties.NewBuffer))
 		{
 			AcquiredBuffer->Memory = Properties.NewBuffer;
 			Properties.NewBuffer = nullptr;
+			Properties.FixupOffset = 0;
 		}
-		else
-		{
-			AcquiredBuffer->Memory -= Properties.FixupOffset;
-		}
-		
-		Properties.FixupOffset = 0;
 	}
 	
 	if (UNLIKELY(!DirectIOPendingReleases.IsEmpty()))
@@ -878,6 +980,25 @@ void FLinuxPlatformIoDispatcher::AllocateDirectMemory(FFileIoStoreReadRequest* R
 	}
 }
 
+
+void FLinuxPlatformIoDispatcher::AllocateMemory(FFileIoStoreReadRequest* Request, const int32 NvmeDeviceIndex)
+{
+	if (EnumHasAnyFlags(Flags, EUringFlags::NvmeDirect))
+	{
+		const uint64 LogicalBlockSize = RegisteredNvmeDevices[NvmeDeviceIndex]->GetLogicalBlockSize();
+		UpdateMemory(LogicalBlockSize);
+	}
+	else if (EnumHasAnyFlags(Flags, EUringFlags::DirectIO))
+	{
+		check(Request->ContainerFilePartition->FileHandle);
+		FLinuxFileHandle* FileHandle = reinterpret_cast<FLinuxFileHandle*>(Request->ContainerFilePartition->FileHandle);
+		const uint64 BlockSize = FileHandle->IsDirect() ? FileHandle->GetBlockSize() : 0;
+		UpdateMemory(BlockSize);
+	}
+	Request->Buffer = AcquiredBuffer;
+	AcquiredBuffer = nullptr;
+}
+
 io_uring_sqe* FLinuxPlatformIoDispatcher::GetSubmissionQueueEvent()
 {
 	io_uring_sqe* NextSqe = io_uring_get_sqe(&Ring);
@@ -885,30 +1006,172 @@ io_uring_sqe* FLinuxPlatformIoDispatcher::GetSubmissionQueueEvent()
 	{
 		return NextSqe;
 	}
-	else
-	{
-		TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::GetSubmissionEvent);
-		do
-		{
-			if (GUseSQPollThread)
-			{
-				VERIFY_URING(io_uring_sqring_wait(&Ring));
-			}
-			else
-			{
-				SubmitRequest(nullptr);
-			}
-			NextSqe = io_uring_get_sqe(&Ring);
-		}
-		while (!NextSqe);
 	
-		return NextSqe;
+	TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::GetSubmissionEvent);
+	do
+	{
+		if (GUseSQPollThread)
+		{
+			VERIFY_URING(io_uring_sqring_wait(&Ring));
+		}
+		else
+		{
+			SubmitRequest(nullptr);
+		}
+		NextSqe = io_uring_get_sqe(&Ring);
 	}
+	while (!NextSqe);
+	
+	return NextSqe;
 }
 
 
+void FLinuxPlatformIoDispatcher::PrepareRequestNvme(FFileIoStoreReadRequest* Request, const int32 NvmeDeviceIndex)
+{
+	check(NvmeDeviceIndex != -1); // Shouldn't happen. SUBMIT_ALL should be supported.
+	check(Request->ContainerFilePartition->FileHandle);
+	
+	FLinuxFileHandle* FileHandle = reinterpret_cast<FLinuxFileHandle*>(Request->ContainerFilePartition->FileHandle);
+	TUniquePtr<FNvmeDevice>& NvmeDevice = RegisteredNvmeDevices[NvmeDeviceIndex];
+	
+	// Make sure the memory location is back to the original start location.
+	FFileIOStoreBufferProperties& Properties = AcquiredBufferProperties.FindChecked(Request->Buffer);
+	Request->Buffer->Memory -= Properties.FixupOffset;
+	Properties.FixupOffset = 0;
+	
+	const uint64 BlockSize = NvmeDevice->GetLogicalBlockSize();
+	const uint64 DataOffset = Request->Offset;
+	const uint64 DataSize = Request->Size;
+	const uint64 PartitionStartLBA = (NvmeDevice->GetStart() * 512) / BlockSize;
+	
+	const uint64 DataEnd = DataOffset + DataSize;
+	
+	const FRegisteredContainer* Container = NvmeDevice->FindContainer(FileHandle);
+	if (!Container)
+	{
+		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to registered container for file %s"), *FileHandle->GetFilename());
+		Request->bFailed = true;
+		OnRequestComplete(Request);
+		return;
+	}
+	
+	FNvmeRequest* Tracker = nullptr;
+	if (!NvmeRequestPool.IsEmpty())
+	{
+		Tracker = NvmeRequestPool.Pop(EAllowShrinking::No);
+	}
+	else
+	{
+		Tracker = new FNvmeRequest;	
+	}
+	Tracker->RemainingRequests = 0;
+	Tracker->Request = Request;
+	
+	// Calculate the N Blocks, 
+	// Find the starting extent, Update N Blocks
+	// If N blocks is zero break, otherwise continue until N blocks is zero.
+	
+	// Calculate the aligned size, and fixup offset.
+	const uint64 AlignedOffset = AlignDown(DataOffset, BlockSize);
+	const uint64 AlignedEnd = Align(DataOffset + DataSize, BlockSize);
+	const uint64 AlignedSize = AlignedEnd - AlignedOffset;
+	Properties.FixupOffset = DataOffset - AlignedOffset;
+	
+	uint8* MemoryPtr = Request->Buffer->Memory;
+	uint64 RemainingBlocks = AlignedSize / BlockSize;
+	bool bFoundStart = false;
+	
+	
+	for (const FPhysicalExtent& Extent : Container->PhysicalExtents)
+	{
+		if (AlignedOffset < Extent.LogicalOffset + Extent.Length && AlignedEnd > Extent.LogicalOffset)
+		{
+			// Setup the sqe
+			io_uring_sqe* SubmissionEvent = GetSubmissionQueueEvent();
+			SubmissionEvent->opcode = IORING_OP_URING_CMD;
+			SubmissionEvent->fd = NvmeDevice->GetFixedFd();
+			SubmissionEvent->flags = IOSQE_FIXED_FILE | GetPriorityFlags();
+			SubmissionEvent->cmd_op = NVME_URING_CMD_IO;
+			SubmissionEvent->uring_cmd_flags = IORING_URING_CMD_FIXED;
+			SubmissionEvent->buf_index = Properties.BufferIndex;
+			SubmissionEvent->user_data = reinterpret_cast<UPTRINT>(Tracker);
+			
+			uint64 StartLb, NumLbs;
+			
+			if (!bFoundStart)
+			{
+				// This is the first request, so we are in the middle of an extent
+				bFoundStart = true;
+				const uint64 PhysicalByteOffset = (AlignedOffset - Extent.LogicalOffset) + Extent.PhysicalOffset;
+				const uint64 BytesAvailableInExtent = (Extent.LogicalOffset + Extent.Length) - AlignedOffset;
+				const uint64 BlocksAvailableInExtent = BytesAvailableInExtent / BlockSize;
+				
+				if (BlocksAvailableInExtent < RemainingBlocks)
+				{
+					// Multiple extents. Slower. Take what we can and go onto the next
+					NumLbs = BlocksAvailableInExtent;
+				}
+				else
+				{
+					// Single extent.
+					NumLbs = RemainingBlocks;
+				}
+				StartLb = (PhysicalByteOffset / BlockSize) + PartitionStartLBA;
+			}
+			else
+			{
+				// Calculate the number of blocks that we have available to use
+				const uint64 NumAvailableBlocks = Extent.Length / BlockSize;
+				if (NumAvailableBlocks > RemainingBlocks)
+				{
+					NumLbs = RemainingBlocks;
+				}
+				else
+				{
+					NumLbs = NumAvailableBlocks; 
+				}
+			
+				// Start of the physical block
+				StartLb = (Extent.PhysicalOffset / BlockSize) + PartitionStartLBA;
+			}
+			
+			struct nvme_uring_cmd* Cmd = reinterpret_cast<struct nvme_uring_cmd*>(SubmissionEvent->cmd);
+			FMemory::Memzero(Cmd, sizeof(struct nvme_uring_cmd));
+			
+			const uint64 PhysicalSize = BlockSize * NumLbs;
+			
+			Cmd->opcode = NVME_CMD_READ; 
+			Cmd->nsid = NvmeDevice->GetNamespace();
+			Cmd->addr = reinterpret_cast<uint64>(MemoryPtr);
+			Cmd->data_len = PhysicalSize;
+			Cmd->cdw10 = (uint32)(StartLb & 0xFFFFFFFF); // Starting Logical Block
+			Cmd->cdw11 = (uint32)(StartLb >> 32);		 // Starting Logical Block
+			Cmd->cdw12 = (uint32)(NumLbs - 1);			 // Num Logical Blocks
+			
+			++NumPendingCompletions;
+			
+			Tracker->RemainingRequests++;
+			
+			RemainingBlocks -= NumLbs;
+			
+			if (RemainingBlocks == 0)
+			{
+				break;
+			}
+			
+			MemoryPtr += PhysicalSize;
+			
+		}
+		else
+		{
+			check(!bFoundStart); // Should be a continuous segment.
+		}
+	}
+	
+	check(RemainingBlocks == 0);
+}
 
-void FLinuxPlatformIoDispatcher::IssueRequest(FFileIoStoreReadRequest* Request)
+void FLinuxPlatformIoDispatcher::PrepareRequestNormal(FFileIoStoreReadRequest* Request)
 {
 	io_uring_sqe* SubmissionEvent = GetSubmissionQueueEvent();
 	FLinuxFileHandle* FileHandle = reinterpret_cast<FLinuxFileHandle*>(Request->ContainerFilePartition->FileHandle);
@@ -917,6 +1180,9 @@ void FLinuxPlatformIoDispatcher::IssueRequest(FFileIoStoreReadRequest* Request)
 	uint64 Size = Request->Size;
 	
 	FFileIOStoreBufferProperties& Properties = AcquiredBufferProperties.FindChecked(Request->Buffer);
+	
+	Request->Buffer->Memory -= Properties.FixupOffset;
+	Properties.FixupOffset = 0;
 	
 	if (FileHandle->IsDirect())
 	{
@@ -930,15 +1196,29 @@ void FLinuxPlatformIoDispatcher::IssueRequest(FFileIoStoreReadRequest* Request)
 		Properties.FixupOffset = DataOffset - AlignedOffset;
 	}
 	
-	SubmissionEvent->opcode = bUseRegisteredBuffers ? IORING_OP_READ_FIXED : IORING_OP_READ;
+	SubmissionEvent->opcode = EnumHasAnyFlags(Flags, EUringFlags::RegisterBuffers) ? IORING_OP_READ_FIXED : IORING_OP_READ;
 	SubmissionEvent->buf_index = Properties.BufferIndex;
 	SubmissionEvent->flags = IOSQE_FIXED_FILE | GetPriorityFlags();
-	SubmissionEvent->fd = FileHandle->GetHandle();
+	SubmissionEvent->fd = FileHandle->GetFd();
 	SubmissionEvent->off = Offset;
 	SubmissionEvent->len = Size;
-	SubmissionEvent->addr = reinterpret_cast<UPTRINT>(Request->Buffer->Memory + Properties.FixupOffset);
-	SubmissionEvent->user_data = reinterpret_cast<UPTRINT>(Request);
+	SubmissionEvent->addr = reinterpret_cast<UPTRINT>(Request->Buffer->Memory + Properties.FixupOffset); // Why are we doing this? 
+	SubmissionEvent->user_data = reinterpret_cast<UPTRINT>(Request);	
+	
 	++NumPendingCompletions;
+}
+
+
+void FLinuxPlatformIoDispatcher::IssueRequest(FFileIoStoreReadRequest* Request, const int32 NvmeDeviceIndex)
+{
+	if (EnumHasAnyFlags(Flags, EUringFlags::NvmeDirect))
+	{
+		PrepareRequestNvme(Request, NvmeDeviceIndex);
+	}
+	else
+	{
+		PrepareRequestNormal(Request);
+	}
 }
 
 void FLinuxPlatformIoDispatcher::SubmitRequest(FFileIoStoreReadRequest* Request)
@@ -971,7 +1251,7 @@ void FLinuxPlatformIoDispatcher::SubmitRequest(FFileIoStoreReadRequest* Request)
 				const int32 Expected = PendingSubmits.Num();
 				const int32 NumSubmitted = io_uring_submit(&Ring);
 				
-				if (LIKELY(Expected == NumSubmitted || bSubmitAll))
+				if (LIKELY(Expected == NumSubmitted || EnumHasAnyFlags(Flags, EUringFlags::SubmitAll)))
 				{
 					break;
 				}
@@ -988,11 +1268,7 @@ void FLinuxPlatformIoDispatcher::SubmitRequest(FFileIoStoreReadRequest* Request)
 				PendingSubmits.RemoveAt(0, NumSubmitted);
 				for (int32 Index = 0; Index < PendingSubmits.Num(); Index++)
 				{
-					if (bUseDirectIO) // Remove the fixup
-					{
-						PendingSubmits[Index]->Buffer->Memory -= AcquiredBufferProperties.FindChecked(PendingSubmits[Index]->Buffer).FixupOffset;
-					}
-					IssueRequest(PendingSubmits[Index]);
+					IssueRequest(PendingSubmits[Index], -1);
 				}
 				
 			} while (true);
@@ -1002,6 +1278,18 @@ void FLinuxPlatformIoDispatcher::SubmitRequest(FFileIoStoreReadRequest* Request)
 	}
 }
 
+FFileIoStoreReadRequest* FLinuxPlatformIoDispatcher::GetNextRequest(FFileIoStoreRequestQueue& RequestQueue)
+{
+	if (!AcquiredBuffer)
+	{
+		AcquiredBuffer = BufferAllocator->AllocBuffer();
+		if (!AcquiredBuffer)
+		{
+			return nullptr;
+		}
+	}
+	return RequestQueue.Pop();
+}
 
 bool FLinuxPlatformIoDispatcher::StartRequests(FFileIoStoreRequestQueue& RequestQueue)
 {
@@ -1009,22 +1297,18 @@ bool FLinuxPlatformIoDispatcher::StartRequests(FFileIoStoreRequestQueue& Request
 	
 	const uint64 CyclesStart = FPlatformTime::Cycles64();
 	
-	if (UNLIKELY(bMustEnableRing))
+	if (UNLIKELY(EnumHasAnyFlags(Flags, EUringFlags::EnableRing)))
 	{
-		bMustEnableRing = false;
+		EnumRemoveFlags(Flags, EUringFlags::EnableRing);
 		VERIFY_URING(io_uring_enable_rings(&Ring));
 	}
 	
-	if (UNLIKELY(bRingNeedsRegistering))
+	if (UNLIKELY(EnumHasAnyFlags(Flags, EUringFlags::RegisterRing)))
 	{
-		bRingNeedsRegistering = false;
+		EnumRemoveFlags(Flags, EUringFlags::RegisterRing);
 		if (const int32 ErrNo = io_uring_register_ring_fd(&Ring); ErrNo != 1)
 		{
-			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to register ring fd, ErrorCode %d, Error %s"), -ErrNo, UTF8_TO_TCHAR(strerror(-ErrNo)));
-		}
-		else
-		{
-			bRingRegistered = true;
+			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to register ring fd, ErrorCode %d, Error %s"), -ErrNo, UTF8_TO_TCHAR(strerror(-ErrNo))); // Not required.
 		}
 	}
 	
@@ -1040,21 +1324,13 @@ bool FLinuxPlatformIoDispatcher::StartRequests(FFileIoStoreRequestQueue& Request
 		}
 	}
 	
+	FFileIoStoreReadRequest* NextRequest;
+	int32 ResultOrIndex;
 	do
 	{
 		while (true)
 		{
-			if (!AcquiredBuffer)
-			{
-				AcquiredBuffer = BufferAllocator->AllocBuffer();
-				if (!AcquiredBuffer)
-				{
-					break;
-				}
-			}
-		
-			FFileIoStoreReadRequest* NextRequest = RequestQueue.Pop();
-			if (!NextRequest)
+			if ((NextRequest = GetNextRequest(RequestQueue)) == nullptr)
 			{
 				break;
 			}
@@ -1064,21 +1340,15 @@ bool FLinuxPlatformIoDispatcher::StartRequests(FFileIoStoreRequestQueue& Request
 				OnRequestComplete(NextRequest);
 				continue;
 			}
-		
-			if (!OpenFile(NextRequest))
+			
+			if ((ResultOrIndex = OpenFile(NextRequest)) == INDEX_NONE)
 			{
 				NextRequest->bFailed = true;
 				OnRequestComplete(NextRequest);
 				continue;
 			}
 			
-			if (bUseDirectIO)
-			{
-				AllocateDirectMemory(NextRequest);
-			}
-		
-			NextRequest->Buffer = AcquiredBuffer;
-			AcquiredBuffer = nullptr;
+			AllocateMemory(NextRequest, ResultOrIndex);
 		
 			if (BlockCache->Read(NextRequest))
 			{
@@ -1086,7 +1356,7 @@ bool FLinuxPlatformIoDispatcher::StartRequests(FFileIoStoreRequestQueue& Request
 				continue;
 			}
 			
-			IssueRequest(NextRequest);
+			IssueRequest(NextRequest, ResultOrIndex);
 			
 			SubmitRequest(NextRequest);
 			

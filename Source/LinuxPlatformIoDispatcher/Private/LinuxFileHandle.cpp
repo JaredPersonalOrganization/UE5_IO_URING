@@ -1,6 +1,5 @@
 #include "LinuxFileHandle.h"
-#include "LinuxFileHandle.h"
-
+#include <sys/sysmacros.h>
 #include <linux/fs.h>
 #include <sys/ioctl.h>
 #include <sys/statfs.h>
@@ -9,6 +8,62 @@
 #include "HAL/PlatformFileManager.h"
 #include "Misc/Paths.h"
 
+
+bool ReadFileContents(const FString& Filename, FString& OutContents)
+{
+	FILE* File = fopen(TCHAR_TO_UTF8(*Filename), "r");
+	if (!File)
+	{
+		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to open file %s. Error %d %s"), *Filename, errno, UTF8_TO_TCHAR(strerror(errno)));
+		return false;
+	}
+	
+	ON_SCOPE_EXIT
+	{
+		fclose(File);
+	};
+	
+	TArray<char> Buf;
+	Buf.SetNum(1024);
+	
+	size_t TotalRead = 0;
+	
+	for (;;)
+	{
+		const size_t BytesRead = fread(Buf.GetData() + TotalRead, 1, Buf.Num() - TotalRead, File);
+		
+		TotalRead += BytesRead;
+		
+		if (BytesRead == 0)
+		{
+			if (ferror(File))
+			{
+				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to read file %s. Error %d %s"), *Filename, errno, UTF8_TO_TCHAR(strerror(errno)));
+				return false;
+			}
+			break;
+		}
+
+		if (TotalRead == Buf.Num())
+		{
+			Buf.SetNum(Buf.Num() * 2); 
+		}
+	}
+	
+	
+	if (TotalRead == Buf.Num())
+	{
+		Buf.Add('\0');
+	}
+	else
+	{
+		Buf[TotalRead] = '\0';
+	}
+	
+	OutContents = Buf.GetData();
+	
+	return true;
+}
 
 static FString NormalizeFilename(const TCHAR* Filename)
 {
@@ -152,77 +207,38 @@ static bool MapFileRecursively(const FString & Filename, int PathComponentToLook
 }
 
 
-FLinuxFileHandle::FLinuxFileHandle(const FString& InFilename, const int32 InHandle, const uint64 InSize, const int32 InOpenFlags, const uint64 InBlockSize)
-	: Filename(InFilename), Size(InSize), BlockSize(InBlockSize), Handle(InHandle), OpenFlags(InOpenFlags), State(Opened)
+FLinuxFileHandle::FLinuxFileHandle(const FString& InFilename, const int32 InFd, const uint64 InSize, const int32 InOpenFlags, const uint64 InBlockSize, const dev_t InDevice)
+	: Filename(InFilename), Size(InSize), BlockSize(InBlockSize), Fd(InFd), OpenFlags(InOpenFlags), Device(InDevice), State(Opened)
 {}
 
 FLinuxFileHandle::~FLinuxFileHandle()
 {
 	Close();
 }
-	
+
 FLinuxFileHandle* FLinuxFileHandle::CreateFileHandle(const TCHAR* FilePath, const bool bUseDirect)
 {
-	// Try to use the filename normally first
-	int32 OpenFlags = O_RDONLY | O_CLOEXEC | __O_NOATIME;
+	int32 OpenFlags = O_RDONLY | O_CLOEXEC | __O_NOATIME; // Should we use NOATIME? 
 	if (bUseDirect)
 	{
 		OpenFlags |= __O_DIRECT;
 	}
-	FString Filename = NormalizeFilename(FilePath);
-	int32 Handle = open(TCHAR_TO_UTF8(*Filename), OpenFlags);
-	if (Handle == -1 && errno != ENOENT && bUseDirect)
-	{
-		UE_LOG(LogLinuxPlatformIO, Warning, TEXT( "Trying to open file %s without O_DIRECT Flag" ), *Filename);
-		OpenFlags &= ~__O_DIRECT; // Try without the flag
-		Handle = open(TCHAR_TO_UTF8(*Filename), OpenFlags);
-	}
 	
+	const FString Filename = NormalizeFilename(FilePath);
+	const char* CFilename = TCHAR_TO_UTF8(*Filename);
+	int32 Handle = open(CFilename, OpenFlags);
 	if (Handle == -1)
 	{
-		if (ENOENT != errno)
+		if (errno != ENOENT && bUseDirect)
 		{
-			int32 ErrNo = errno;
-			UE_LOG(LogLinuxPlatformIO, Warning, TEXT( "open('%s', O_RDONLY | O_CLOEXEC) failed: errno=%d (%s)" ), *Filename, ErrNo, UTF8_TO_TCHAR(strerror(ErrNo)));
-			return nullptr;
-		}
-		
-#if (UE_GAME || UE_SERVER)
-		// According to Unreal we have no business transversing the filesystem during Game and Server builds. The filepath should be correct.
-		static bool bReadingFromPakFiles = FPlatformFileManager::Get().FindPlatformFile(TEXT("PakFile")) != nullptr;
-		if (LIKELY(bReadingFromPakFiles))
-		{
-			return -1;
-		}
-#endif
-		
-		const int MaxPathComponents = CountPathComponents(Filename);
-		if (MaxPathComponents > 0)
-		{
-			FString FoundFilename(TEXT("/"));	// start with root
-			if (MapFileRecursively(Filename, 0, MaxPathComponents, FoundFilename))
-			{
-				Handle = open(TCHAR_TO_UTF8(*FoundFilename), OpenFlags);
-				if (Handle == -1 && errno != ENOENT && bUseDirect)
-				{
-					UE_LOG(LogLinuxPlatformIO, Warning, TEXT( "Trying to open file %s without O_DIRECT Flag" ), *Filename);
-					OpenFlags &= ~__O_DIRECT; // Try without the flag
-					Handle = open(TCHAR_TO_UTF8(*Filename), OpenFlags);
-				}
-				if (Handle != -1)
-				{
-					if (Filename != FoundFilename)
-					{
-						Filename = FoundFilename;
-						UE_LOG(LogLinuxPlatformIO, Log, TEXT("Mapped '%s' to '%s'"), *Filename, *FoundFilename);
-					}
-				}
-			}
+			OpenFlags &= ~__O_DIRECT; // Try again without O_DIRECT
+			Handle = open(CFilename, OpenFlags);
 		}
 	}
 	
 	if (Handle == -1)
 	{
+		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("open(Filename, OpenFlags) failed: Filename=(%s). Flags=(%d), error=%d, error=%s"), *Filename, OpenFlags, errno, UTF8_TO_TCHAR(strerror(errno)));
 		return nullptr;
 	}
 	
@@ -230,62 +246,39 @@ FLinuxFileHandle* FLinuxFileHandle::CreateFileHandle(const TCHAR* FilePath, cons
 	if (fstat(Handle, &FileInfo) == -1)
 	{
 		int32 ErrNo = errno;
-		UE_LOG(LogLinuxPlatformIO, Warning, TEXT( "fstat(Handle, &FileInfo) failed: File %s, errno=%d, Error (%s)" ), *Filename, ErrNo, UTF8_TO_TCHAR(strerror(ErrNo)));
+		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("fstat(Handle, &FileInfo) failed: Filename=(%s), errno=(%d), error=(%s)" ), *Filename, ErrNo, UTF8_TO_TCHAR(strerror(ErrNo)));
 		return nullptr;
 	}
 	
 	uint64 RequiredAlignment = 0;
 	if (OpenFlags & __O_DIRECT)
 	{
-		if (S_ISBLK(FileInfo.st_mode))
+		if (!S_ISREG(FileInfo.st_mode))
 		{
-			uint32 LogicalSectorSize = 0;
-			if (ioctl(Handle, BLKSSZGET, &LogicalSectorSize) == -1)
-			{
-				int32 ErrNo = errno;
-				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("BLKSSZGET failed: File %s, errno=%d (%s)"), *Filename, ErrNo, UTF8_TO_TCHAR(strerror(ErrNo)));
-				return nullptr;
-			}
-
-			uint32 PhysicalSectorSize = 0;
-			if (ioctl(Handle, BLKPBSZGET, &PhysicalSectorSize) == -1)
-			{
-				int32 ErrNo = errno;
-				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("BLKPBSZGET failed: File %s, errno=%d (%s)"), *Filename, ErrNo, UTF8_TO_TCHAR(strerror(ErrNo)));
-				return nullptr;
-			}
-
-			RequiredAlignment = FMath::Max<uint64>(LogicalSectorSize, PhysicalSectorSize);
-		}
-		else if (S_ISREG(FileInfo.st_mode))
-		{
-			struct statfs FsInfo;
-			if (fstatfs(Handle, &FsInfo) == -1)
-			{
-				int32 ErrNo = errno;
-				UE_LOG(LogLinuxPlatformIO, Warning, TEXT("fstatfs failed: File %s, errno=%d (%s)"), *Filename, ErrNo, UTF8_TO_TCHAR(strerror(ErrNo)));
-				return nullptr;
-			}
-			RequiredAlignment = FsInfo.f_bsize;
-		}
-		else
-		{
-			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Unsupported file type for DIRECT IO: %s"), *Filename);
+			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Unsupported file type for DIRECT IO: filename=(%s), type=(%u)"), *Filename, FileInfo.st_mode);
 			return nullptr;
 		}
+		
+		struct statfs FsInfo;
+		if (fstatfs(Handle, &FsInfo) == -1)
+		{
+			int32 ErrNo = errno;
+			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("fstatfs(Handle, &FsInfo) fstatfs failed: File=(%s), errno=(%d) error=(%s)"), *Filename, ErrNo, UTF8_TO_TCHAR(strerror(ErrNo)));
+			return nullptr;
+		}
+		RequiredAlignment = FsInfo.f_bsize;
 	}
 	
-	
-	return new FLinuxFileHandle(Filename, Handle, FileInfo.st_size, OpenFlags, RequiredAlignment);
+	return new FLinuxFileHandle(Filename, Handle, FileInfo.st_size, OpenFlags, RequiredAlignment, FileInfo.st_dev);
 }
 	
 void FLinuxFileHandle::Close()
 {
 	if (State == Opened)
 	{
-		close(Handle);
+		close(Fd);
 		State = Closed;
-		Handle = -1;
+		Fd = -1;
 	}
 }
 
@@ -293,10 +286,10 @@ bool FLinuxFileHandle::Open()
 {
 	if (State != Opened)
 	{
-		Handle = open(TCHAR_TO_UTF8(*Filename), OpenFlags);
-		if (Handle == -1)
+		Fd = open(TCHAR_TO_UTF8(*Filename), OpenFlags);
+		if (Fd == -1)
 		{
-			int32 ErrNo = errno;
+			const int32 ErrNo = errno;
 			UE_LOG(LogLinuxPlatformIO, Warning, TEXT( "open('%s', O_RDONLY | O_CLOEXEC) failed: errno=%d (%s)" ), *Filename, ErrNo, UTF8_TO_TCHAR(strerror(ErrNo)));
 			return false;
 		}

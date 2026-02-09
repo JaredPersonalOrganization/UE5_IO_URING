@@ -1,15 +1,15 @@
 #pragma once
+#include <sys/sysmacros.h>
 #include "CoreMinimal.h"
 
 
 
 
-
-
+bool ReadFileContents(const FString& Filename, FString& OutContents);
 
 class FLinuxFileHandle
 {
-	FLinuxFileHandle(const FString& InFilename, const int32 InHandle, const uint64 InSize, const int32 InOpenFlags, const uint64 InBlockSize);
+	FLinuxFileHandle(const FString& InFilename, const int32 InFd, const uint64 InSize, const int32 InOpenFlags, const uint64 InBlockSize, const dev_t InDevice);
 public:
 	~FLinuxFileHandle();
 	
@@ -26,9 +26,9 @@ public:
 		Fixed
 	};
 	
-	void UpdateHandle(const int32 InHandle, const EHandleState InState)
+	void UpdateFd(const int32 InHandle, const EHandleState InState)
 	{
-		Handle = InHandle;
+		Fd = InHandle;
 		State = InState;
 	}
 	
@@ -37,9 +37,9 @@ public:
 		return State;
 	}
 	
-	int32 GetHandle() const
+	int32 GetFd() const
 	{
-		return Handle;
+		return Fd;
 	}
 	
 	uint64 GetSize() const
@@ -62,12 +62,27 @@ public:
 		return BlockSize;
 	}
 	
+	uint32 GetDeviceMajor() const
+	{
+		return major(Device);
+	}
+	
+	uint32 GetDeviceMinor() const
+	{
+		return minor(Device);
+	}
+	
+	dev_t GetDevice() const
+	{
+		return Device;
+	}
 
 private:
 	FString Filename;
 	uint64 Size = 0;
 	uint64 BlockSize = 0;
-	int32  Handle = 0;
+	int32  Fd = 0;
 	int32  OpenFlags = 0;
+	dev_t Device;
 	EHandleState State = Closed;
 };
