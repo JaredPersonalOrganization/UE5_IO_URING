@@ -1,6 +1,7 @@
 #pragma once
 #include "CoreMinimal.h"
 #include "LinuxFileHandle.h"
+#include "LinuxPlatformIoDispatcherModule.h"
 
 
 struct FPhysicalExtent
@@ -10,10 +11,12 @@ struct FPhysicalExtent
 	uint64 Length = 0;
 };
 
-struct FRegisteredContainer
+class FRegisteredContainer
 {
-	TArray<FPhysicalExtent> PhysicalExtents;
-	class FLinuxFileHandle* Handle = nullptr;
+public:
+	FRegisteredContainer(TArray<FPhysicalExtent>&& InPhysicalExtents, const FLinuxFileHandle* InHandle)
+		: PhysicalExtents(MoveTemp(InPhysicalExtents)), Handle(InHandle)
+	{}
 	
 	void DebugOutput()
 	{
@@ -23,9 +26,43 @@ struct FRegisteredContainer
 			OutputString += FString::Printf(TEXT("{Index: %d, LogicalOffset %llu, Length %llu, PhysicalOffset %llu}"), 
 				Index, PhysicalExtents[Index].LogicalOffset, PhysicalExtents[Index].Length, PhysicalExtents[Index].PhysicalOffset);
 		}
-		UE_LOG(LogTemp, Warning, TEXT("File %s, Mappings: %s"), *Handle->GetFilename(), *OutputString);
+		UE_LOG(LogLinuxPlatformIO, Display, TEXT("File %s, Mappings: %s"), *Handle->GetFilename(), *OutputString);
 	}
+	
+	int32 FindStartExtent(const uint64 InLogicalOffset) const
+	{
+		int32 FoundIndex = INDEX_NONE;
+		if (PhysicalExtents.Num() > 24)
+		{
+			// Binary search. Drives can become quite segmented.
+			FoundIndex = Algo::LowerBound(PhysicalExtents, InLogicalOffset, [](const FPhysicalExtent& PhysicalExtent, const uint64 Offset)
+			{
+				return (PhysicalExtent.LogicalOffset + PhysicalExtent.Length) <= Offset;
+			});
+		}
+		else
+		{
+			//  Linear search
+			for (int32 Index = 0; Index < PhysicalExtents.Num(); Index++)
+			{
+				if (PhysicalExtents[Index].LogicalOffset + PhysicalExtents[Index].Length > InLogicalOffset)
+				{
+					FoundIndex = Index;
+					break;
+				}
+			}
+		}
+		return FoundIndex;
+	}
+	
+	TArray<FPhysicalExtent> PhysicalExtents;
+private:
+	const class FLinuxFileHandle* Handle = nullptr;
+	friend class FNvmeDevice;
 };
+
+
+
 
 
 class FNvmeDevice
@@ -46,6 +83,8 @@ public:
 	void UnregisterContainer(const class FLinuxFileHandle* Handle);
 	
 	const FRegisteredContainer* FindContainer(const class FLinuxFileHandle* Handle);
+	
+	void DebugOutput() const;
 	
 	dev_t GetDeviceId() const
 	{
@@ -103,13 +142,22 @@ private:
 	TArray<FRegisteredContainer> RegisteredContainers;
 	
 	FString CharacterDevice;
+	
 	FString ControllerDevice;
+	
 	dev_t DeviceId = 0;
+	
 	uint64 Start = 0;
+	
 	uint64 Size = 0;
+	
 	uint64 Partitions = 0;
+	
 	uint64 LogicalBlockSize = 0;
+	
 	int32 Fd = -1;
+	
 	int32 FixedFd = -1;
+	
 	int32 NamespaceId = -1;
 };

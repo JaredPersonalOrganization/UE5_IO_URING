@@ -39,6 +39,23 @@ static inline bool sq_ring_needs_enter(struct io_uring *ring,
 	return false;
 }
 
+int io_uring_sqpoll_wake(struct io_uring *ring)
+{
+	if (!(ring->flags & IORING_SETUP_SQPOLL))
+		return 0;
+	
+	/*
+	 * Ensure the kernel can see the store to the SQ tail before we read
+	 * the flags.
+	 */
+	io_uring_smp_mb();
+
+	if (uring_unlikely(IO_URING_READ_ONCE(*ring->sq.kflags) & IORING_SQ_NEED_WAKEUP)) {
+		return __sys_io_uring_enter(ring->enter_ring_fd, 0,0, IORING_ENTER_SQ_WAKEUP, NULL);
+	}
+	return 0;
+}
+
 static inline bool cq_ring_needs_flush(struct io_uring *ring)
 {
 	return IO_URING_READ_ONCE(*ring->sq.kflags) &

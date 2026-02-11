@@ -26,7 +26,7 @@ bool GUseSQPollThread = false;
 static FAutoConsoleVariableRef CVarSQPollThread(
 	TEXT("r.Linux.Streaming.UseSQPollThread"),
 	GUseSQPollThread,
-	TEXT("Whether to use a SQPoll thread. This isn't a free performance switch. Currently makes the performance worse.\n"),
+	TEXT("Whether to use a SQPoll thread. This isn't a free performance switch. Currently makes the performance worse."),
 	ECVF_ReadOnly
 );
 
@@ -56,9 +56,9 @@ static FAutoConsoleVariableRef CVarUseIOPoll(
 
 bool GUseNvmeDirect= false;
 static FAutoConsoleVariableRef CVarUseNvmeDirect(
-	TEXT("r.Linux.Streaming.UseNvmeDirect"),
+	TEXT("r.Linux.Streaming.NVMEPassthrough"),
 	GUseNvmeDirect,
-	TEXT("Whether use Nnvme commands directly with io_uring. Experimental."),
+	TEXT("Whether use NVME Passthrough directly with io_uring. Experimental."),
 	ECVF_ReadOnly
 );
 
@@ -74,7 +74,7 @@ int32 GMaxNumOpenFiles = 1024;
 static FAutoConsoleVariableRef CVarMaxOpenFiles(
 	TEXT("r.Linux.Streaming.MaxFixedFiles"),
 	GMaxNumOpenFiles,
-	TEXT("Maximum number of fixed Files. Does not change the process max. If you need more files, increase the process max too. Default 1024\n"),
+	TEXT("Maximum number of fixed Files. Does not change the process max. If you need more files, increase the process max too. Default 1024"),
 	ECVF_ReadOnly
 );
 
@@ -82,7 +82,7 @@ int32 GQueueDepth = -1;
 static FAutoConsoleVariableRef CVarQueueDepth(
 	TEXT("r.Linux.Streaming.QueueDepth"),
 	GQueueDepth,
-	TEXT("Sets the queue depth of the submission queue entries. Default matches the number of read buffers.\n"),
+	TEXT("Sets the queue depth of the submission queue entries. Default matches the number of read buffers."),
 	ECVF_ReadOnly
 );
 
@@ -200,7 +200,7 @@ void FLinuxPlatformIoDispatcher::Initialize(const FInitializePlatformFileIoStore
 	BufferAllocator = Params.BufferAllocator;
 	BlockCache = Params.BlockCache;
 	Stats = Params.Stats;
-	FinalizeUring();
+	Finalize();
 }
 
 void FLinuxPlatformIoDispatcher::RegisterFile(class FLinuxFileHandle* File)
@@ -335,7 +335,7 @@ int32 FLinuxPlatformIoDispatcher::OpenFile(FFileIoStoreReadRequest* Request)
 		{
 			return INDEX_NONE;
 		}
-		RegisterNvmeFile(FileHandle);
+		RegisterFile(FileHandle);
 	}
 	return 0;
 }
@@ -389,7 +389,7 @@ void FLinuxPlatformIoDispatcher::UpdateRegisteredBuffers(uint8* Start)
 	
 	UpdateRegisteredBuffersOffset();
 	
-	UE_LOG(LogLinuxPlatformIO, Display, TEXT("Registered %d buffers with %llu size for io_uring"), RegisteredBuffers.Num(), ActualBufferSize);
+	UE_LOG(LogLinuxPlatformIO, Display, TEXT("Successfully registered %d buffers. TotalSize %llu, ActualBufferSize %llu, "), RegisteredBuffers.Num(), TotalSize, ActualBufferSize);
 }
 
 void FLinuxPlatformIoDispatcher::UpdateRegisteredBuffersOffset()
@@ -416,7 +416,7 @@ void FLinuxPlatformIoDispatcher::UpdateRegisteredBuffersOffset()
 TUniquePtr<FLinuxPlatformIoDispatcher> FLinuxPlatformIoDispatcher::Create()
 {
 	TUniquePtr<FLinuxPlatformIoDispatcher> Impl = MakeUnique<FLinuxPlatformIoDispatcher>(FPrivateToken());
-	if (!Impl->InitializeUring())
+	if (!Impl->Initialize())
 	{
 		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to create io_uring dispatcher. Falling back to default"));
 		return nullptr;
@@ -427,6 +427,10 @@ TUniquePtr<FLinuxPlatformIoDispatcher> FLinuxPlatformIoDispatcher::Create()
 int32 FLinuxPlatformIoDispatcher::CreateRing()
 {
 	const bool bIsMultiThreaded = FGenericPlatformProcess::SupportsMultithreading();
+	if (!bIsMultiThreaded)
+	{
+		EnumRemoveFlags(Flags, EUringFlags::SQPoll);
+	}
 	
 	int32 MaxPendingRequests = GQueueDepth;
 	if (MaxPendingRequests == -1)
@@ -446,7 +450,8 @@ int32 FLinuxPlatformIoDispatcher::CreateRing()
 	io_uring_params Params;
 	FMemory::Memset(&Params, 0, sizeof(Params));
 	FMemory::Memset(&Ring, 0, sizeof(Ring));
-	if (bIsMultiThreaded && GUseSQPollThread)
+	
+	if (EnumHasAnyFlags(Flags, EUringFlags::SQPoll))
 	{
 		check(GSQPollIdleTimeMS > 0);
 #if TEST_WORST_CASE
@@ -460,6 +465,7 @@ int32 FLinuxPlatformIoDispatcher::CreateRing()
 		Params.sq_thread_idle = GSQPollIdleTimeMS;
 		
 		EnumRemoveFlags(Flags, EUringFlags::RegisterRing);
+		EnumRemoveFlags(Flags, EUringFlags::EnableRing);
 		
 		if (EnumHasAnyFlags(Flags, EUringFlags::IOPoll))
 		{
@@ -531,7 +537,7 @@ int32 FLinuxPlatformIoDispatcher::CreateRing()
 	}
 }
 
-void FLinuxPlatformIoDispatcher::FinalizeUring()
+void FLinuxPlatformIoDispatcher::Finalize()
 {
 #if TEST_WORST_CASE
 	bUseRegisteredBuffers = false;
@@ -548,10 +554,11 @@ void FLinuxPlatformIoDispatcher::FinalizeUring()
 	{
 		return A.Memory < B.Memory;
 	});
+	
 	NumAllocatedBuffers = FreeBuffers.Num();
 	ActualBufferSize = BufferAllocator->GetBufferSize();
-	
 	AcquiredBufferProperties.Reserve(NumAllocatedBuffers);
+	
 	for (int32 BufferIndex = 0; BufferIndex < NumAllocatedBuffers; BufferIndex++)
 	{
 		AcquiredBufferProperties.Add(FreeBuffers[BufferIndex]);
@@ -562,10 +569,8 @@ void FLinuxPlatformIoDispatcher::FinalizeUring()
 		FMemory::Free(FreeBuffers[0]->Memory);
 			
 		// Reallocate the buffers with the correct size
-		const uint64 ReadBufferSize = BufferAllocator->GetBufferSize();
-		
 		BufferAlignment = GIODefaultBufferAlignment;
-		ActualBufferSize = Align(ReadBufferSize + 2 * BufferAlignment, BufferAlignment);
+		ActualBufferSize = Align(ActualBufferSize + 2 * BufferAlignment, BufferAlignment);
 		DirectIOBuffer = static_cast<uint8*>(FMemory::Malloc(ActualBufferSize * NumAllocatedBuffers, BufferAlignment));
 		
 		FMemory::Memzero(DirectIOBuffer, ActualBufferSize * NumAllocatedBuffers);
@@ -607,13 +612,18 @@ void AddFlags(EUringFlags& Flags)
 	{
 		FlagsToAdd |= static_cast<uint8>(EUringFlags::RegisterBuffers);
 	}
+	if (GUseSQPollThread)
+	{
+		FlagsToAdd |= static_cast<uint8>(EUringFlags::SQPoll);
+	}
 	
 	EnumAddFlags(Flags, static_cast<EUringFlags>(FlagsToAdd));
 }
 
 
-bool FLinuxPlatformIoDispatcher::InitializeUring()
+bool FLinuxPlatformIoDispatcher::Initialize()
 {
+	UE_LOG(LogLinuxPlatformIO, Display, TEXT("Initializing Linux Platform IO"));
 	// Add the flags
 	AddFlags(Flags);
 	
@@ -657,7 +667,6 @@ bool FLinuxPlatformIoDispatcher::InitializeUring()
 	}
 	
 	CompletedCqesBuffer.SetNum(Ring.cq.ring_entries);
-	
 	
 	// Set up registered files.
 	{
@@ -713,16 +722,7 @@ bool FLinuxPlatformIoDispatcher::InitializeUring()
 			EnumRemoveFlags(Flags, EUringFlags::RegisterBuffers);
 			UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Dropping registered buffers for io_uring. Not enough space within locked memory. Has %llu, Needs %llu"), RLimit.rlim_cur, TotalBufferSize);
 		}
-		else if (EnumHasAnyFlags(Flags, EUringFlags::NvmeDirect))
-		{
-			auto DispatcherBufferSizeKB = IConsoleManager::Get().FindConsoleVariable(TEXT("s.IoDispatcherBufferSizeKB"));
-			check(DispatcherBufferSizeKB);
-			
-			const uint64 ReadBufferSize = static_cast<uint64>(DispatcherBufferSizeKB->GetInt()) << 10ull;
-			const uint64 BufferCount = TotalBufferSize / ReadBufferSize;
-			
-		}
-		else if (EnumHasAnyFlags(Flags, EUringFlags::DirectIO)) // DirectIO requires more locked memory
+		else if (EnumHasAnyFlags(Flags, EUringFlags::DirectIO) || EnumHasAnyFlags(Flags, EUringFlags::NvmeDirect)) // DirectIO/DirectNVME requires more locked memory
 		{
 			auto DispatcherBufferSizeKB = IConsoleManager::Get().FindConsoleVariable(TEXT("s.IoDispatcherBufferSizeKB"));
 			check(DispatcherBufferSizeKB);
@@ -815,19 +815,22 @@ void FLinuxPlatformIoDispatcher::ProcessCompletedRequests()
 	{
 		if (EnumHasAnyFlags(Flags, EUringFlags::IOPoll))
 		{
-			// If we have any events available during io_uring_enter it will return 0, so do this to avoid entering the kernel.
-			const uint32 NumEventsReady = io_uring_cq_ready(&Ring);
-			if (NumEventsReady == 0)
+			if (EnumHasAnyFlags(Flags, EUringFlags::SQPoll))
 			{
-				// The big issue with this part is that the kernel will only poll for single bio I/Os.
-				// And there is a high chance that we don't have single bio I/Os.
-				// We are still going to have to enter the kernel to check for it.
+				// If we have a SQPoll thread it will handle polling for us
+				io_uring_sqpoll_wake(&Ring);
+			}
+			else if (io_uring_cq_ready(&Ring) == 0) // If we have any events available during io_uring_enter it will return immediately. So do this to avoid entering the kernel.
+			{
+				// The problem IOPoll is that the kernel will only poll for single bio requests.
+				// And there's a high chance that we don't have any single bio I/Os.
+				// And we still have to enter the kernel to check it.
 				// All of this doesn't apply for nvme commands.
 				VERIFY_URING(io_uring_enter(Ring.enter_ring_fd, 0, 0,  ring_enter_flags(&Ring) | IORING_ENTER_GETEVENTS, nullptr));
 			}
 		}
 		
-		const uint32 Ready = io_uring_peek_batch_cqe(&Ring, CompletedCqesBuffer.GetData(), CompletedCqesBuffer.Num()); // May enter the kernel for GetEvents if we are overflowing.
+		const uint32 Ready = io_uring_peek_batch_cqe(&Ring, CompletedCqesBuffer.GetData(), CompletedCqesBuffer.Num()); // May enter the kernel if we are deferring task run or are overflowing.
 		if (Ready > 0)
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::ProcessCompletedRequests);
@@ -980,7 +983,6 @@ void FLinuxPlatformIoDispatcher::UpdateMemory(const uint64 BlockSize)
 	}
 }
 
-
 void FLinuxPlatformIoDispatcher::AllocateMemory(FFileIoStoreReadRequest* Request, const int32 NvmeDeviceIndex)
 {
 	if (EnumHasAnyFlags(Flags, EUringFlags::NvmeDirect))
@@ -1010,7 +1012,7 @@ io_uring_sqe* FLinuxPlatformIoDispatcher::GetSubmissionQueueEvent()
 	TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::GetSubmissionEvent);
 	do
 	{
-		if (GUseSQPollThread)
+		if (EnumHasAnyFlags(Flags, EUringFlags::SQPoll))
 		{
 			VERIFY_URING(io_uring_sqring_wait(&Ring));
 		}
@@ -1055,15 +1057,7 @@ void FLinuxPlatformIoDispatcher::PrepareRequestNvme(FFileIoStoreReadRequest* Req
 		return;
 	}
 	
-	FNvmeRequest* Tracker = nullptr;
-	if (!NvmeRequestPool.IsEmpty())
-	{
-		Tracker = NvmeRequestPool.Pop(EAllowShrinking::No);
-	}
-	else
-	{
-		Tracker = new FNvmeRequest;	
-	}
+	FNvmeRequest* Tracker = NvmeRequestPool.IsEmpty() ? new FNvmeRequest : NvmeRequestPool.Pop();
 	Tracker->RemainingRequests = 0;
 	Tracker->Request = Request;
 	
@@ -1081,91 +1075,86 @@ void FLinuxPlatformIoDispatcher::PrepareRequestNvme(FFileIoStoreReadRequest* Req
 	uint64 RemainingBlocks = AlignedSize / BlockSize;
 	bool bFoundStart = false;
 	
-	
-	for (const FPhysicalExtent& Extent : Container->PhysicalExtents)
+	const int32 StartExtentIndex = Container->FindStartExtent(AlignedOffset);
+	if (UNLIKELY(StartExtentIndex == INDEX_NONE || StartExtentIndex == Container->PhysicalExtents.Num()))
 	{
-		if (AlignedOffset < Extent.LogicalOffset + Extent.Length && AlignedEnd > Extent.LogicalOffset)
+		UE_LOG(LogLinuxPlatformIO, Warning, TEXT("Failed to find starting extent for file %s at offset %llu"), *FileHandle->GetFilename(), AlignedOffset);
+		Request->bFailed = true;
+		OnRequestComplete(Request);
+		return;
+	}
+	
+	for (int32 CurrentExtentIndex = StartExtentIndex; CurrentExtentIndex < Container->PhysicalExtents.Num(); ++CurrentExtentIndex)
+	{
+		io_uring_sqe* SubmissionEvent = GetSubmissionQueueEvent();
+		SubmissionEvent->opcode = IORING_OP_URING_CMD;
+		SubmissionEvent->fd = NvmeDevice->GetFixedFd();
+		SubmissionEvent->flags = IOSQE_FIXED_FILE;
+		SubmissionEvent->cmd_op = NVME_URING_CMD_IO;
+		SubmissionEvent->uring_cmd_flags = IORING_URING_CMD_FIXED;
+		SubmissionEvent->buf_index = Properties.BufferIndex;
+		SubmissionEvent->user_data = reinterpret_cast<UPTRINT>(Tracker);
+		
+		const FPhysicalExtent& Extent = Container->PhysicalExtents[CurrentExtentIndex];
+		uint64 StartLb, NumLbs;
+		
+		if (CurrentExtentIndex == StartExtentIndex)
 		{
-			// Setup the sqe
-			io_uring_sqe* SubmissionEvent = GetSubmissionQueueEvent();
-			SubmissionEvent->opcode = IORING_OP_URING_CMD;
-			SubmissionEvent->fd = NvmeDevice->GetFixedFd();
-			SubmissionEvent->flags = IOSQE_FIXED_FILE | GetPriorityFlags();
-			SubmissionEvent->cmd_op = NVME_URING_CMD_IO;
-			SubmissionEvent->uring_cmd_flags = IORING_URING_CMD_FIXED;
-			SubmissionEvent->buf_index = Properties.BufferIndex;
-			SubmissionEvent->user_data = reinterpret_cast<UPTRINT>(Tracker);
-			
-			uint64 StartLb, NumLbs;
-			
-			if (!bFoundStart)
+			const uint64 PhysicalByteOffset = (AlignedOffset - Extent.LogicalOffset) + Extent.PhysicalOffset;
+			const uint64 BytesAvailableInExtent = (Extent.LogicalOffset + Extent.Length) - AlignedOffset;
+			const uint64 BlocksAvailableInExtent = BytesAvailableInExtent / BlockSize;
+			if (BlocksAvailableInExtent < RemainingBlocks)
 			{
-				// This is the first request, so we are in the middle of an extent
-				bFoundStart = true;
-				const uint64 PhysicalByteOffset = (AlignedOffset - Extent.LogicalOffset) + Extent.PhysicalOffset;
-				const uint64 BytesAvailableInExtent = (Extent.LogicalOffset + Extent.Length) - AlignedOffset;
-				const uint64 BlocksAvailableInExtent = BytesAvailableInExtent / BlockSize;
-				
-				if (BlocksAvailableInExtent < RemainingBlocks)
-				{
-					// Multiple extents. Slower. Take what we can and go onto the next
-					NumLbs = BlocksAvailableInExtent;
-				}
-				else
-				{
-					// Single extent.
-					NumLbs = RemainingBlocks;
-				}
-				StartLb = (PhysicalByteOffset / BlockSize) + PartitionStartLBA;
+				NumLbs = BlocksAvailableInExtent; // Multiple extents. Slower.
 			}
 			else
 			{
-				// Calculate the number of blocks that we have available to use
-				const uint64 NumAvailableBlocks = Extent.Length / BlockSize;
-				if (NumAvailableBlocks > RemainingBlocks)
-				{
-					NumLbs = RemainingBlocks;
-				}
-				else
-				{
-					NumLbs = NumAvailableBlocks; 
-				}
-			
-				// Start of the physical block
-				StartLb = (Extent.PhysicalOffset / BlockSize) + PartitionStartLBA;
+				NumLbs = RemainingBlocks; // Single extent.
 			}
-			
-			struct nvme_uring_cmd* Cmd = reinterpret_cast<struct nvme_uring_cmd*>(SubmissionEvent->cmd);
-			FMemory::Memzero(Cmd, sizeof(struct nvme_uring_cmd));
-			
-			const uint64 PhysicalSize = BlockSize * NumLbs;
-			
-			Cmd->opcode = NVME_CMD_READ; 
-			Cmd->nsid = NvmeDevice->GetNamespace();
-			Cmd->addr = reinterpret_cast<uint64>(MemoryPtr);
-			Cmd->data_len = PhysicalSize;
-			Cmd->cdw10 = (uint32)(StartLb & 0xFFFFFFFF); // Starting Logical Block
-			Cmd->cdw11 = (uint32)(StartLb >> 32);		 // Starting Logical Block
-			Cmd->cdw12 = (uint32)(NumLbs - 1);			 // Num Logical Blocks
-			
-			++NumPendingCompletions;
-			
-			Tracker->RemainingRequests++;
-			
-			RemainingBlocks -= NumLbs;
-			
-			if (RemainingBlocks == 0)
-			{
-				break;
-			}
-			
-			MemoryPtr += PhysicalSize;
-			
+			StartLb = (PhysicalByteOffset / BlockSize) + PartitionStartLBA;
 		}
 		else
 		{
-			check(!bFoundStart); // Should be a continuous segment.
+			check(AlignedOffset < Extent.LogicalOffset && AlignedOffset + AlignedSize > Extent.LogicalOffset); // Sanity check. Should be continuous.
+			
+			const uint64 NumAvailableBlocks = Extent.Length / BlockSize;
+			if (NumAvailableBlocks > RemainingBlocks)
+			{
+				NumLbs = RemainingBlocks; // Done
+			}
+			else
+			{
+				NumLbs = NumAvailableBlocks; 
+			}
+			StartLb = (Extent.PhysicalOffset / BlockSize) + PartitionStartLBA;
 		}
+		
+		struct nvme_uring_cmd* Cmd = reinterpret_cast<struct nvme_uring_cmd*>(SubmissionEvent->cmd);
+		FMemory::Memzero(Cmd, sizeof(struct nvme_uring_cmd));
+			
+		const uint64 PhysicalSize = BlockSize * NumLbs;
+			
+		Cmd->opcode = NVME_CMD_READ; 
+		Cmd->nsid = NvmeDevice->GetNamespace();
+		Cmd->addr = reinterpret_cast<uint64>(MemoryPtr);
+		Cmd->data_len = PhysicalSize;
+		Cmd->cdw10 = static_cast<uint32>(StartLb & 0xFFFFFFFF); // Starting Logical Block
+		Cmd->cdw11 = static_cast<uint32>(StartLb >> 32);		// Starting Logical Block
+		Cmd->cdw12 = static_cast<uint32>(NumLbs - 1) & 0xFFFF;	// Num Logical Blocks. 16 bits. Could add an assert in the setup if the read size is going to be larger than this.
+		Cmd->cdw13 |= NVME_RW_DSM_LATENCY_LOW;					// Lowest latency. No idea what this actually does.
+			
+		++NumPendingCompletions;
+			
+		++Tracker->RemainingRequests;
+			
+		RemainingBlocks -= NumLbs;
+			
+		if (RemainingBlocks == 0)
+		{
+			break;
+		}
+			
+		MemoryPtr += PhysicalSize;
 	}
 	
 	check(RemainingBlocks == 0);
@@ -1223,58 +1212,50 @@ void FLinuxPlatformIoDispatcher::IssueRequest(FFileIoStoreReadRequest* Request, 
 
 void FLinuxPlatformIoDispatcher::SubmitRequest(FFileIoStoreReadRequest* Request)
 {
-	if (GUseSQPollThread)
+	if (EnumHasAnyFlags(Flags, EUringFlags::SQPoll))
 	{
 		VERIFY_URING(io_uring_submit(&Ring));
 	}
 	else
 	{
-		bool bShouldSubmit = Request == nullptr;
 		if (Request)
 		{
-			// TODO: See if we can use EventsAhead to determine the optimal batch size
-			// const int32 NumEventsAhead = NumCompletionEventsAhead.load(std::memory_order_acquire);
-			
 			PendingSubmits.Add(Request);
-			if (PendingSubmits.Num() >= GBatchSubmitSize)
+			if (PendingSubmits.Num() < GBatchSubmitSize)
 			{
-				bShouldSubmit = true;
+				return;
 			}
 		}
 		
-		if (bShouldSubmit)
+		TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::SubmitRequests);
+		do
 		{
-			TRACE_CPUPROFILER_EVENT_SCOPE(FLinuxPlatformIoDispatcherImpl::SubmitRequests);
-			// For information on submission read IORING_SETUP_SUBMIT_ALL section in https://man7.org/linux/man-pages/man2/io_uring_setup.2.html
-			do
+			const int32 Expected = PendingSubmits.Num();
+			const int32 NumSubmitted = io_uring_submit(&Ring);
+				
+			if (LIKELY(Expected == NumSubmitted || EnumHasAnyFlags(Flags, EUringFlags::SubmitAll)))
 			{
-				const int32 Expected = PendingSubmits.Num();
-				const int32 NumSubmitted = io_uring_submit(&Ring);
+				break;
+			}
 				
-				if (LIKELY(Expected == NumSubmitted || EnumHasAnyFlags(Flags, EUringFlags::SubmitAll)))
-				{
-					break;
-				}
+			if (NumSubmitted == -EBUSY)
+			{
+				// Overflow in the completion queue while leaving io_uring_enter. We still successfully submitted all the requests and have to clear the completion queue.
+				ProcessCompletedRequests();	
+				break;
+			}
+			VERIFY_URING_VALUE(NumSubmitted);
 				
-				if (NumSubmitted == -EBUSY)
-				{
-					// Overflow in the completion queue while leaving io_uring_enter. We still successfully submitted all the requests and have to clear the completion queue.
-					ProcessCompletedRequests();	
-					break;
-				}
-				VERIFY_URING_VALUE(NumSubmitted);
+			// CQE should've posted for the failed event. Go past it.
+			PendingSubmits.RemoveAt(0, NumSubmitted);
+			for (int32 Index = 0; Index < PendingSubmits.Num(); Index++)
+			{
+				IssueRequest(PendingSubmits[Index], -1);
+			}
 				
-				// CQE should've posted for the failed event. Go past it.
-				PendingSubmits.RemoveAt(0, NumSubmitted);
-				for (int32 Index = 0; Index < PendingSubmits.Num(); Index++)
-				{
-					IssueRequest(PendingSubmits[Index], -1);
-				}
-				
-			} while (true);
+		} while (true);
 			
-			PendingSubmits.Reset();
-		}
+		PendingSubmits.Reset();
 	}
 }
 
@@ -1363,7 +1344,7 @@ bool FLinuxPlatformIoDispatcher::StartRequests(FFileIoStoreRequestQueue& Request
 			ProcessCompletedRequests();	
 		}
 		
-		if (PendingSubmits.Num() > 0)
+		if (!PendingSubmits.IsEmpty())
 		{
 			SubmitRequest(nullptr);
 			ProcessCompletedRequests();	

@@ -1578,7 +1578,10 @@ IOURINGINLINE void io_uring_prep_cmd_sock(struct io_uring_sqe *sqe,
 	sqe->optlen = optlen;
 	sqe->level = level;
 }
-
+	
+/* Wakes the sqpoll thread if necessary */	
+int io_uring_sqpoll_wake(struct io_uring *ring);
+	
 IOURINGINLINE void io_uring_prep_cmd_getsockname(struct io_uring_sqe *sqe,
 						 int fd, struct sockaddr *sockaddr,
 						 socklen_t *sockaddr_len,

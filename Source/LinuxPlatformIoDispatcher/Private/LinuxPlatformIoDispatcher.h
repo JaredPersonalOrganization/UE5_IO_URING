@@ -59,7 +59,8 @@ enum class EUringFlags
 	RegisterBuffers = (1 << 3),
 	DirectIO = (1 << 4),
 	IOPoll = (1 << 5),
-	NvmeDirect = (1 << 6),
+	SQPoll = (1 << 6),
+	NvmeDirect = (1 << 7),
 	
 	Default = RegisterRing | EnableRing | SubmitAll,
 };
@@ -131,9 +132,9 @@ private:
 	
 	void UpdateRegisteredBuffersOffset();
 	
-	void FinalizeUring();
+	void Finalize();
 	
-	bool InitializeUring();
+	bool Initialize();
 	
 	int32 CreateRing();
 	

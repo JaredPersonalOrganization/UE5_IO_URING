@@ -63,7 +63,6 @@ TUniquePtr<IPlatformFileIoStore> FLinuxPlatformIoDispatcherModule::CreatePlatfor
 {
 	if (GUseLinuxPlatformIO)
 	{
-		UE_LOG(LogLinuxPlatformIO, Display, TEXT("Initialize Linux Platform IO"));
 		bIsInitialized = true;
 		return FLinuxPlatformIoDispatcher::Create();
 	}

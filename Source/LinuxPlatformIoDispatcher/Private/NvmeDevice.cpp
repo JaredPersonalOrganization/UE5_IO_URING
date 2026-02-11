@@ -119,6 +119,12 @@ bool GetLogicalBlockSizeValue(const FString& ControllerPath, const FString& SysB
 }
 
 
+void IssueAdminCommand(const int32 OpCode)
+{
+	
+}
+
+
 FNvmeDevice::FNvmeDevice(FPrivateToken)
 {}
 	
@@ -163,6 +169,12 @@ const FRegisteredContainer* FNvmeDevice::FindContainer(const class FLinuxFileHan
 		}
 	}
 	return nullptr;
+}
+
+void FNvmeDevice::DebugOutput() const
+{
+	UE_LOG(LogLinuxPlatformIO, Display, TEXT("Successfully parsed NVME Device. Character Device %s, Controller Device %s, Start %llu, Paritions %llu, Size %llu, LogicalBlockSize %llu, Namespace %d"), 
+		*CharacterDevice, *ControllerDevice, Start, Partitions, Size, LogicalBlockSize, NamespaceId);
 }
 
 bool FNvmeDevice::RegisterContainer(class FLinuxFileHandle* Handle)
@@ -224,14 +236,11 @@ bool FNvmeDevice::RegisterContainer(class FLinuxFileHandle* Handle)
 		{
 			fiemap_extent& Ext = Map->fm_extents[Index];
 			
-			FPhysicalExtent Entry;
-			
-			Entry.LogicalOffset = Ext.fe_logical;
-			Entry.PhysicalOffset = Ext.fe_physical; 
-			Entry.Length = Ext.fe_length;
-			
-
-			PhysicalExtents.Add(Entry);
+			PhysicalExtents.Add(FPhysicalExtent{
+				.LogicalOffset = Ext.fe_logical,
+				.PhysicalOffset = Ext.fe_physical,
+				.Length = Ext.fe_length
+			});
 			
 			if (Ext.fe_flags & FIEMAP_EXTENT_LAST)
 			{
@@ -247,13 +256,7 @@ bool FNvmeDevice::RegisterContainer(class FLinuxFileHandle* Handle)
 		}
 	}
 	
-	RegisteredContainers.Add(FRegisteredContainer{
-		.PhysicalExtents = MoveTemp(PhysicalExtents),
-		.Handle = Handle,
-	});
-	
-	
-	RegisteredContainers[RegisteredContainers.Num()-1].DebugOutput();
+	RegisteredContainers.Add(FRegisteredContainer(MoveTemp(PhysicalExtents), Handle));
 	
 	return true;
 }
@@ -304,9 +307,7 @@ bool FNvmeDevice::Initialize(const dev_t InDeviceId)
 		return false;
 	}
 	
-	UE_LOG(LogLinuxPlatformIO, Display, TEXT("Successfully parsed NVME Device. SysBlock %s, Character Device %s, Controller Device %s, Start %llu, Paritions %llu, Size %llu, LogicalBlockSize %llu"), 
-		*SysBlock, *CharacterDevice, *ControllerDevice, Start, Partitions, Size, LogicalBlockSize);
-	
+	// Open the character device
 	Fd = open(TCHAR_TO_UTF8(*CharacterDevice), O_RDONLY);
 	if (Fd < 0)
 	{
@@ -314,6 +315,7 @@ bool FNvmeDevice::Initialize(const dev_t InDeviceId)
 		return false;
 	}
 	
+	// Get the namespace id
 	NamespaceId = ioctl(Fd, NVME_IOCTL_ID);
 	if (NamespaceId < 0)
 	{
@@ -321,7 +323,8 @@ bool FNvmeDevice::Initialize(const dev_t InDeviceId)
 		return false;
 	}
 	
-	UE_LOG(LogLinuxPlatformIO, Display, TEXT("Successfully opened character device %s. Namespace %d"), *CharacterDevice, NamespaceId);
+	
+	DebugOutput();
 	
 	return true;
 }
